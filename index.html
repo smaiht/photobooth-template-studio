@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ru">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Template Studio</title>
+    <link rel="icon" href="data:,">
+
+    <script
+        src="https://code.jquery.com/jquery-3.5.1.min.js"
+        integrity="sha384-ZvpUoO/+PpLXR1lu4jmpXWu80pZlYUAfxl5NsBMWOEPSjUn/6Z/hRTt8+pR6L4N2"
+        crossorigin="anonymous"></script>
+    <script>
+        jQuery.fn.outerHTML = function () {
+            return jQuery('<div />').append(this.eq(0).clone()).html();
+        };
+        Number.prototype.countDecimals = function () {
+            if (Math.floor(this.valueOf()) === this.valueOf()) return 0;
+            return this.toString().split(".")[1].length || 0;
+        }
+    </script>
+
+    <script src="./vendor/fabric.min.js"></script>
+
+    <script
+        src="https://cdn.jsdelivr.net/npm/spectrum-colorpicker2@2.0.10/dist/spectrum.min.js"
+        integrity="sha384-dJ9xWMM5d2r/Yw9JxHjt5MTq3btriRZha7oJabe5C10sLsthDhMHA07zh82MVikY"
+        crossorigin="anonymous"></script>
+    <link rel="stylesheet" type="text/css"
+        href="https://cdn.jsdelivr.net/npm/spectrum-colorpicker2@2.0.10/dist/spectrum.min.css"
+        integrity="sha384-R6C/W4Nqqekc1ZeBe5I/vEMpAJS024syUNQwwbuxA05wpYKoK6N+GGRwCZdRuiNx"
+        crossorigin="anonymous">
+
+    <script
+        src="https://ajax.googleapis.com/ajax/libs/webfont/1.6.26/webfont.js"
+        integrity="sha384-pvXSwSU09c+q9mPyY++ygUHWIYRoaxgnJ/JC5wcOzMb/NVVu+IDniiB9qWp3ZNWM"
+        crossorigin="anonymous"></script>
+
+    <script src="./vendor/grapick.min.js"></script>
+    <link rel="stylesheet" href="./vendor/grapick.min.css">
+
+    <script>
+        window.lang = (navigator.language || 'ru').toLowerCase().startsWith('ru') ? 'ru' : 'en';
+    </script>
+
+    <script src="./lib/history.js"></script>
+    <script src="./lib/core.js"></script>
+    <script src="./lib/toolbar.js"></script>
+    <script src="./lib/canvas.js"></script>
+    <script src="./lib/shapes.js"></script>
+    <script src="./lib/images.js"></script>
+    <script src="./lib/freeDrawSettings.js"></script>
+    <script src="./lib/canvasSettings.js"></script>
+    <script src="./lib/selectionSettings.js"></script>
+    <script src="./lib/drawingLine.js"></script>
+    <script src="./lib/drawingPath.js"></script>
+    <script src="./lib/drawingText.js"></script>
+    <script src="./lib/upload.js"></script>
+    <script src="./lib/copyPaste.js"></script>
+    <script src="./lib/animation.js"></script>
+    <script src="./lib/utils.js"></script>
+    <script src="./lib/zoom.js"></script>
+    <script src="./lib/fullscreen.js"></script>
+    <script src="./lib/tip.js"></script>
+    <script src="./lib/saveInBrowser.js"></script>
+    <script src="./lib/notification.js"></script>
+
+    <link rel="stylesheet" type="text/css" href="./style.css">
+
+</head>
+
+<body>
+    <div class="appLoader">
+        <div class="loader-card">
+            <span class="loader-mark">TS</span>
+            <span class="loader-copy">
+                <strong>Template Studio</strong>
+                <small>Preparing workspace…</small>
+            </span>
+        </div>
+    </div>
+
+    <div id="image-editor-container">
+
+    </div>
+    <script src="./script.js"></script>
+</body>
+
+</html>
