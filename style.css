@@ -1876,13 +1876,6 @@ select:focus-visible,
     background: #e7e3ff;
 }
 
-#select-panel .text-box-width-hint {
-    margin: -6px 0 14px;
-    color: #7b8698;
-    font-size: 10px;
-    line-height: 1.4;
-}
-
 #select-panel .section-hint,
 .template-export-content .section-hint {
     margin: -3px 0 10px;
@@ -1912,30 +1905,16 @@ select:focus-visible,
     grid-column: 1 / -1;
 }
 
-#select-panel .geometry-grid .geometry-uniform-scale,
 #select-panel .geometry-size-summary {
     display: none;
 }
 
-#select-panel.type-textbox .geometry-size-field,
 #select-panel.type-i-text .geometry-size-field,
-#select-panel.type-text .geometry-size-field,
-#select-panel.type-textbox .geometry-axis-scale,
-#select-panel.type-i-text .geometry-axis-scale,
-#select-panel.type-text .geometry-axis-scale {
+#select-panel.type-i-text .geometry-axis-scale {
     display: none;
 }
 
-#select-panel.type-textbox .geometry-grid .geometry-uniform-scale,
-#select-panel.type-i-text .geometry-grid .geometry-uniform-scale,
-#select-panel.type-text .geometry-grid .geometry-uniform-scale {
-    grid-column: 1 / -1;
-    display: grid;
-}
-
-#select-panel.type-textbox .geometry-size-summary,
-#select-panel.type-i-text .geometry-size-summary,
-#select-panel.type-text .geometry-size-summary {
+#select-panel.type-i-text .geometry-size-summary {
     grid-column: 1 / -1;
     display: block;
     margin: 0;
@@ -1954,15 +1933,11 @@ select:focus-visible,
     display: none;
 }
 
-.toolpanel#select-panel.type-textbox .text-section,
-.toolpanel#select-panel.type-i-text .text-section,
-.toolpanel#select-panel.type-text .text-section {
+.toolpanel#select-panel.type-i-text .text-section {
     display: block;
 }
 
-.toolpanel#select-panel.type-textbox .fill-section,
 .toolpanel#select-panel.type-i-text .fill-section,
-.toolpanel#select-panel.type-text .fill-section,
 .toolpanel#select-panel.type-image .fill-section {
     display: none;
 }

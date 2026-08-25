@@ -34,7 +34,7 @@
       },
     ],
   };
-  const DRAFT_KEY = 'current-project';
+  const DRAFT_KEY = 'current-project-v2';
   const BACKGROUND_TYPES = new Set([
     'image/jpeg',
     'image/png',
@@ -262,7 +262,7 @@
       'draw',
       'line',
       'path',
-      'textbox',
+      'text',
       'photo-layout',
       'trim',
       'background',
@@ -284,7 +284,7 @@
     const fontInput = document.createElement('input');
     const fontAssets = new Map();
     const onlineFontAssetLoads = new Map();
-    const textTypes = new Set(['i-text', 'textbox', 'text']);
+    const textTypes = new Set(['i-text']);
     const backgroundState = {
       fileName: null,
       fileSize: null,
@@ -348,15 +348,19 @@
       if (
         byFile
         && (!family || byFile.family === family)
-        && (!byFile.fontStyle || byFile.fontStyle === normalizedStyle)
+        && (
+          byFile.fontStyle === normalizedStyle
+          || (!byFile.fontStyle && normalizedStyle === 'normal')
+        )
       ) {
         return byFile;
       }
 
       const byFamily = assets.filter(asset => asset.family === family);
       return byFamily.find(asset => asset.fontStyle === normalizedStyle)
-        || byFamily.find(asset => !asset.fontStyle)
-        || byFamily[0]
+        || (normalizedStyle === 'normal'
+          ? byFamily.find(asset => !asset.fontStyle)
+          : null)
         || null;
     }
 
@@ -610,11 +614,57 @@
     imgEditor.getFontAsset = (family, fontStyle) => (
       findFontAsset(family, null, fontStyle)
     );
+    imgEditor.isOnlineFontFamily = family => onlineFontFamilies.has(family);
     imgEditor.getDefaultTextFont = () => (
       [...fontAssets.values()].find(asset => asset.source !== 'google-fonts')
       || fontAssets.values().next().value
       || null
     );
+    imgEditor.applyTextFontAsset = (object, asset) => {
+      object.set({
+        fontFamily: asset.family,
+        fontFile: asset.fileName,
+        fontStyle: asset.fontStyle || 'normal',
+        styles: {},
+      });
+      imgEditor.refreshTextDimensions(object, asset.family);
+    };
+    imgEditor.toggleTextItalic = async object => {
+      if (!isTextObject(object)) return;
+
+      const fontStyle = object.fontStyle === 'italic' ? 'normal' : 'italic';
+
+      try {
+        const asset = onlineFontFamilies.has(object.fontFamily)
+          ? await cacheOnlineFont(object.fontFamily, fontStyle, object.fontWeight)
+          : findFontAsset(object.fontFamily, null, fontStyle);
+
+        if (!asset) {
+          imgEditor.toast(
+            translate(
+              'Для этого шрифта нет отдельного italic-файла. Загрузите italic TTF/OTF как отдельный шрифт.',
+              'This font has no separate italic file. Upload the italic TTF/OTF as a separate font.',
+            ),
+            'Danger',
+            4000,
+          );
+          return;
+        }
+
+        imgEditor.applyTextFontAsset(object, asset);
+        imgEditor.canvas.fire('object:property-realy-changed', { target: object });
+        if (imgEditor.activeSelection === object) {
+          imgEditor.setSelectionValues();
+        }
+      } catch (error) {
+        console.warn('[template-studio] could not load italic font', error);
+        imgEditor.toast(
+          translate('Не удалось загрузить italic-файл шрифта', 'Could not load the italic font file'),
+          'Danger',
+          3500,
+        );
+      }
+    };
     imgEditor.cacheOnlineFont = cacheOnlineFont;
     imgEditor.chooseLocalFont = () => fontInput.click();
 
@@ -710,7 +760,7 @@
       }
 
       await window.saveInBrowser.save(DRAFT_KEY, {
-        version: 1,
+        version: 2,
         savedAt: Date.now(),
         canvas: canvasDraftJSON(),
         backgroundFill: imgEditor.getBackgroundFillState(),
@@ -755,8 +805,20 @@
         try {
           imgEditor.canvas.loadFromJSON(canvasData, () => {
             imgEditor.canvas.getObjects().forEach(object => {
-              if (['i-text', 'textbox', 'text'].includes(object.type)) {
-                object.set('paintFirst', 'stroke');
+              if (object.type === 'i-text') {
+                const align = object.textAlign === 'left' || object.textAlign === 'right'
+                  ? object.textAlign
+                  : 'center';
+                object.set({
+                  originX: align,
+                  originY: 'center',
+                  textAlign: align,
+                  paintFirst: 'stroke',
+                  strokeUniform: true,
+                  centeredRotation: false,
+                  styles: {},
+                });
+                imgEditor.refreshTextDimensions(object);
               }
             });
             imgEditor.canvas.requestRenderAll();
@@ -771,7 +833,7 @@
     async function restoreDraft() {
       const draft = await window.saveInBrowser.load(DRAFT_KEY);
 
-      if (!draft || draft.version !== 1 || !draft.canvas) {
+      if (!draft || draft.version !== 2 || !draft.canvas) {
         return false;
       }
 
@@ -1143,19 +1205,8 @@
       return Number.isFinite(number) ? Math.round(number) : 400;
     }
 
-    function legacyRotation(angle) {
-      const normalized = ((Number(angle) % 360) + 360) % 360;
-
-      if (Math.abs(normalized - 90) < 0.01) return 'cw';
-      if (Math.abs(normalized - 270) < 0.01) return 'ccw';
-      return 'none';
-    }
-
-    function fontAssetForStyle(style, object) {
-      const styleFamily = style.fontFamily || object.fontFamily;
-      const fileName = style.fontFile || object.fontFile;
-      const fontStyle = style.fontStyle || object.fontStyle || 'normal';
-      const asset = findFontAsset(styleFamily, fileName, fontStyle);
+    function fontAssetForText(object) {
+      const asset = fontAssetForObject(object);
 
       if (!asset) {
         const sample = String(object.text || '').replace(/\s+/g, ' ').slice(0, 32);
@@ -1167,120 +1218,63 @@
       return asset;
     }
 
-    function completeTextStyle(object, lineIndex, characterIndex) {
-      if (typeof object.getCompleteStyleDeclaration === 'function') {
-        return object.getCompleteStyleDeclaration(lineIndex, characterIndex) || {};
-      }
-      return object;
-    }
+    function exportTextBlock(object, usedFonts) {
+      imgEditor.normalizeTextScale?.(object);
+      object.set({ styles: {}, strokeUniform: true });
 
-    function textLineData(object, line, lineIndex, usedFonts) {
-      const style = completeTextStyle(object, lineIndex, 0);
-      const asset = fontAssetForStyle(style, object);
-      const scaleX = Math.abs(Number(object.scaleX) || 1);
-      const scaleY = Math.abs(Number(object.scaleY) || 1);
-      const averageScale = (scaleX + scaleY) / 2;
-      const fill = colorWithOpacity(style.fill ?? object.fill, object.opacity);
-      const stroke = style.stroke ?? object.stroke;
-      const strokeWidth = (Number(style.strokeWidth ?? object.strokeWidth) || 0) / 2;
-      const strokeColor = stroke
-        ? colorWithOpacity(stroke, object.opacity, fill)
+      const align = object.textAlign === 'left' || object.textAlign === 'right'
+        ? object.textAlign
+        : 'center';
+      const anchor = object.getPointByOrigin(align, 'center');
+      if (
+        anchor.x < 0
+        || anchor.x > PRINT_WIDTH
+        || anchor.y < 0
+        || anchor.y > PRINT_HEIGHT
+      ) {
+        const sample = String(object.text || '').replace(/\s+/g, ' ').slice(0, 32);
+        throw new Error(translate(
+          `Якорь подписи «${sample || 'без текста'}» находится за холстом`,
+          `The anchor of “${sample || 'empty text'}” is outside the canvas`,
+        ));
+      }
+
+      const asset = fontAssetForText(object);
+      const fill = colorWithOpacity(object.fill, object.opacity);
+      const strokeWidth = Math.max(0, (Number(object.strokeWidth) || 0) / 2);
+      const hasStroke = Boolean(object.stroke) && strokeWidth > 0;
+      const strokeColor = hasStroke
+        ? colorWithOpacity(object.stroke, object.opacity, fill)
         : fill;
-      const fontSize = Number(style.fontSize ?? object.fontSize) || 40;
-      const weight = numericWeight(style.fontWeight ?? object.fontWeight);
 
       usedFonts.set(asset.fileName, asset);
 
       return {
-        text: line,
-        font: asset.fileName,
-        size: Math.max(4, Math.min(2000, Math.round(
-          fontSize * scaleY,
-        ))),
-        weight,
-        color: fill,
-        stroke_width: stroke ? Math.max(0, Math.round(strokeWidth * averageScale)) : 0,
-        stroke_color: strokeColor,
-        layout_v2: {
-          font: asset.fileName,
-          font_size: round(fontSize),
-          font_weight: weight,
-          font_style: style.fontStyle ?? object.fontStyle ?? 'normal',
-          color: fill,
-          stroke_width: round(strokeWidth),
-          stroke_color: strokeColor,
-          underline: Boolean(style.underline ?? object.underline),
-          linethrough: Boolean(style.linethrough ?? object.linethrough),
-        },
-      };
-    }
-
-    function exportTextBlock(object, usedFonts) {
-      const center = object.getCenterPoint();
-      if (
-        center.x < 0
-        || center.x > PRINT_WIDTH
-        || center.y < 0
-        || center.y > PRINT_HEIGHT
-      ) {
-        const sample = String(object.text || '').replace(/\s+/g, ' ').slice(0, 32);
-        throw new Error(translate(
-          `Центр подписи «${sample || 'без текста'}» находится за холстом`,
-          `The center of “${sample || 'empty text'}” is outside the canvas`,
-        ));
-      }
-      const visibleLines = object.type === 'textbox' && Array.isArray(object.textLines)
-        ? object.textLines.map(line => (
-          Array.isArray(line) ? line.join('') : String(line)
-        ))
-        : String(object.text ?? '').split('\n');
-      const lines = visibleLines.map(
-        (line, lineIndex) => textLineData(object, line, lineIndex, usedFonts),
-      );
-      const firstLine = lines[0];
-
-      return {
+        text: String(object.text ?? ''),
         position: {
-          x: Math.round(center.x),
-          y: Math.round(center.y),
+          x: Math.round(anchor.x),
+          y: Math.round(anchor.y),
         },
-        rotate: legacyRotation(object.angle || 0),
-        font: firstLine.font,
-        weight: firstLine.weight,
-        color: firstLine.color,
-        stroke_width: firstLine.stroke_width,
-        stroke_color: firstLine.stroke_color,
+        align,
+        angle: round(object.angle || 0),
+        skew: {
+          x: round(object.skewX || 0),
+          y: round(object.skewY || 0),
+        },
+        flip: {
+          x: Boolean(object.flipX),
+          y: Boolean(object.flipY),
+        },
+        font: asset.fileName,
+        size: Math.max(4, Math.min(2000, Math.round(Number(object.fontSize) || 40))),
+        weight: numericWeight(object.fontWeight),
+        color: fill,
+        stroke_width: hasStroke ? round(strokeWidth) : 0,
+        stroke_color: strokeColor,
         line_spacing: Math.max(0.5, Math.min(4, round(object.lineHeight || 1.2))),
-        lines,
-        layout_v2: {
-          text: String(object.text ?? ''),
-          position_origin: 'center',
-          object_type: object.type,
-          box: {
-            width: round(object.width || 0),
-            height: round(object.height || 0),
-          },
-          rendered_size: {
-            width: round(object.getScaledWidth()),
-            height: round(object.getScaledHeight()),
-          },
-          scale: {
-            x: round(object.scaleX || 1, 6),
-            y: round(object.scaleY || 1, 6),
-          },
-          angle: round(object.angle || 0),
-          skew: {
-            x: round(object.skewX || 0),
-            y: round(object.skewY || 0),
-          },
-          flip: {
-            x: Boolean(object.flipX),
-            y: Boolean(object.flipY),
-          },
-          text_align: object.textAlign || 'left',
-          char_spacing: round(object.charSpacing || 0),
-          opacity: round(object.opacity ?? 1),
-        },
+        char_spacing: round(object.charSpacing || 0),
+        underline: Boolean(object.underline),
+        linethrough: Boolean(object.linethrough),
       };
     }
 
@@ -1329,11 +1323,9 @@
           photo_index: photo.photo_index,
           x: Math.round(photo.x),
           y: Math.round(photo.y),
+          width: Math.round(photo.width),
+          height: Math.round(photo.height),
           rotate: 'none',
-          layout_v2: {
-            width: Math.round(photo.width),
-            height: Math.round(photo.height),
-          },
         })),
       };
 
@@ -1346,10 +1338,6 @@
         key,
         usedFonts,
         config: {
-          _template_studio: {
-            schema: 2,
-            extended_text_layout: 'layout_v2',
-          },
           print_size: [PRINT_WIDTH, PRINT_HEIGHT],
           print_trim: printTrim,
           templates: {
@@ -1479,8 +1467,7 @@
       if (duplicate) {
         const object = imgEditor.activeSelection;
         if (isTextObject(object)) {
-          imgEditor.setActiveFontStyle(object, 'fontFamily', duplicate.family);
-          object.set('fontFile', duplicate.fileName);
+          imgEditor.applyTextFontAsset(object, duplicate);
           imgEditor.canvas.requestRenderAll();
           imgEditor.canvas.fire('object:property-realy-changed');
           imgEditor.setSelectionValues();
@@ -1503,8 +1490,7 @@
         const object = imgEditor.activeSelection;
 
         if (isTextObject(object)) {
-          imgEditor.setActiveFontStyle(object, 'fontFamily', asset.family);
-          object.set('fontFile', asset.fileName);
+          imgEditor.applyTextFontAsset(object, asset);
           imgEditor.canvas.requestRenderAll();
           imgEditor.canvas.fire('object:property-realy-changed');
           imgEditor.setSelectionValues();
