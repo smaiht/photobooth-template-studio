@@ -731,6 +731,23 @@ select:focus-visible,
     accent-color: var(--accent);
 }
 
+#select-panel .range-number-control {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 68px;
+    align-items: center;
+    gap: 8px;
+}
+
+#select-panel .range-number-control input[type="range"] {
+    height: 24px;
+}
+
+#select-panel .range-number-control input[type="number"] {
+    padding: 0 6px;
+    text-align: center;
+}
+
 .toolpanel .input-container .custom-number-input {
     width: 100%;
     height: 34px;
@@ -1893,6 +1910,38 @@ select:focus-visible,
 
 #select-panel .geometry-grid .geometry-angle {
     grid-column: 1 / -1;
+}
+
+#select-panel .geometry-grid .geometry-uniform-scale,
+#select-panel .geometry-size-summary {
+    display: none;
+}
+
+#select-panel.type-textbox .geometry-size-field,
+#select-panel.type-i-text .geometry-size-field,
+#select-panel.type-text .geometry-size-field,
+#select-panel.type-textbox .geometry-axis-scale,
+#select-panel.type-i-text .geometry-axis-scale,
+#select-panel.type-text .geometry-axis-scale {
+    display: none;
+}
+
+#select-panel.type-textbox .geometry-grid .geometry-uniform-scale,
+#select-panel.type-i-text .geometry-grid .geometry-uniform-scale,
+#select-panel.type-text .geometry-grid .geometry-uniform-scale {
+    grid-column: 1 / -1;
+    display: grid;
+}
+
+#select-panel.type-textbox .geometry-size-summary,
+#select-panel.type-i-text .geometry-size-summary,
+#select-panel.type-text .geometry-size-summary {
+    grid-column: 1 / -1;
+    display: block;
+    margin: 0;
+    color: #788397;
+    font-size: 11px;
+    line-height: 1.4;
 }
 
 .toolpanel#select-panel .text-section,

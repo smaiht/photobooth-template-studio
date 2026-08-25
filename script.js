@@ -42,6 +42,40 @@
   ]);
   const FONT_FILE_PATTERN = /\.(?:ttf|otf)$/i;
   const GOOGLE_FONTS_RAW = 'https://raw.githubusercontent.com/google/fonts/main';
+  const BUNDLED_FONTS = [
+    {
+      family: 'Comfortaa',
+      label: 'Comfortaa',
+      fileName: 'Comfortaa-VariableFont_wght.ttf',
+      fontStyle: 'normal',
+      weightMin: 300,
+      weightMax: 700,
+    },
+    {
+      family: 'Great Vibes',
+      label: 'Great Vibes',
+      fileName: 'GreatVibes-Regular.ttf',
+      fontStyle: 'normal',
+      weightMin: 400,
+      weightMax: 400,
+    },
+    {
+      family: 'Shantell Sans',
+      label: 'Shantell Sans',
+      fileName: 'ShantellSans-VariableFont_BNCE,INFM,SPAC,wght.ttf',
+      fontStyle: 'normal',
+      weightMin: 300,
+      weightMax: 800,
+    },
+    {
+      family: 'Shantell Sans',
+      label: 'Shantell Sans',
+      fileName: 'ShantellSans-Italic-VariableFont_BNCE,INFM,SPAC,wght.ttf',
+      fontStyle: 'italic',
+      weightMin: 300,
+      weightMax: 800,
+    },
+  ];
 
   function clone(value) {
     return JSON.parse(JSON.stringify(value));
@@ -306,6 +340,7 @@
 
     function findFontAsset(family, fileName = null, fontStyle = null) {
       const assets = [...fontAssets.values()];
+      const normalizedStyle = fontStyle === 'italic' ? 'italic' : 'normal';
       const byFile = fileName
         ? assets.find(asset => asset.fileName === fileName)
         : null;
@@ -313,18 +348,15 @@
       if (
         byFile
         && (!family || byFile.family === family)
-        && (
-          byFile.source !== 'google-fonts'
-          || !fontStyle
-          || byFile.fontStyle === fontStyle
-        )
+        && (!byFile.fontStyle || byFile.fontStyle === normalizedStyle)
       ) {
         return byFile;
       }
 
       const byFamily = assets.filter(asset => asset.family === family);
-      return byFamily.find(asset => asset.source !== 'google-fonts')
-        || byFamily.find(asset => !fontStyle || asset.fontStyle === fontStyle)
+      return byFamily.find(asset => asset.fontStyle === normalizedStyle)
+        || byFamily.find(asset => !asset.fontStyle)
+        || byFamily[0]
         || null;
     }
 
@@ -334,13 +366,20 @@
       )?.value;
 
       localFontOptions.replaceChildren();
+      const renderedFamilies = new Set();
+
       [...fontAssets.values()]
         .filter(asset => asset.source !== 'google-fonts')
         .sort((left, right) => left.label.localeCompare(right.label, 'ru'))
         .forEach(asset => {
+          if (renderedFamilies.has(asset.family)) return;
+          renderedFamilies.add(asset.family);
+
           const option = document.createElement('option');
           option.value = asset.family;
-          option.textContent = `${asset.label} · ${asset.fileName}`;
+          option.textContent = asset.source === 'bundled'
+            ? `${asset.label} · ${translate('встроенный', 'built-in')}`
+            : `${asset.label} · ${asset.fileName}`;
           localFontOptions.appendChild(option);
         });
 
@@ -378,6 +417,35 @@
       fontAssets.set(asset.fileName, asset);
       renderLocalFontOptions();
       return asset;
+    }
+
+    async function installBundledFonts() {
+      for (const bundledFont of BUNDLED_FONTS) {
+        try {
+          const response = await fetch(
+            `./assets/fonts/${encodeURIComponent(bundledFont.fileName)}`,
+          );
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+
+          const downloaded = await response.blob();
+          const blob = downloaded.slice(0, downloaded.size, 'font/ttf');
+          await installFontAsset({
+            ...bundledFont,
+            fileSize: blob.size,
+            mimeType: 'font/ttf',
+            dataURL: await readFileAsDataURL(blob),
+            source: 'bundled',
+          });
+        } catch (error) {
+          console.error(
+            '[template-studio] could not load bundled font',
+            bundledFont.fileName,
+            error,
+          );
+        }
+      }
     }
 
     function metadataValue(block, field) {
@@ -649,7 +717,7 @@
         printTrim: imgEditor.getPrintTrimState(),
         trimPreview: imgEditor.getTrimPreviewState(),
         photoLayoutView: imgEditor.getPhotoLayoutViewState(),
-        fonts: [...fontAssets.values()],
+        fonts: [...fontAssets.values()].filter(asset => asset.source !== 'bundled'),
         templateExport: {
           key: document.querySelector('#export-template-key')?.value || 'grid',
           label: document.querySelector('#export-template-label')?.value || '',
@@ -1702,6 +1770,8 @@
       removeBackground,
       saveDraft: saveCurrentDraft,
     };
+
+    await installBundledFonts();
 
     let restoredDraft = false;
 
