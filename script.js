@@ -1152,6 +1152,19 @@
       config: document.querySelector('#download-template-config'),
       package: document.querySelector('#download-template-package'),
     };
+    const importControls = {
+      config: document.querySelector('#import-template-config'),
+      background: document.querySelector('#import-template-background'),
+      choice: document.querySelector('#import-template-choice'),
+      key: document.querySelector('#import-template-key'),
+      backgroundHint: document.querySelector('#import-template-background-hint'),
+      run: document.querySelector('#import-template-run'),
+      fonts: document.querySelector('#import-template-fonts'),
+      fontInput: document.querySelector('#import-template-font-input'),
+      status: document.querySelector('#import-template-status'),
+    };
+    let importConfig = null;
+    let missingImportFonts = [];
 
     function isTextObject(object) {
       return textTypes.has(object?.type);
@@ -1203,6 +1216,285 @@
       if (value === 'bold') return 700;
       const number = Number(value);
       return Number.isFinite(number) ? Math.round(number) : 400;
+    }
+
+    function templateImportError(russian, english) {
+      return new Error(translate(russian, english));
+    }
+
+    function setImportStatus(message = '', type = '') {
+      importControls.status.hidden = !message;
+      importControls.status.textContent = message;
+      importControls.status.className = `template-import-status${type ? ` ${type}` : ''}`;
+    }
+
+    function clearMissingImportFonts() {
+      missingImportFonts = [];
+      importControls.fonts.hidden = true;
+    }
+
+    function updateImportButton() {
+      importControls.run.disabled = (
+        importControls.run.classList.contains('busy')
+        || !importConfig
+        || !importControls.key.value
+        || !importControls.background.files?.[0]
+      );
+    }
+
+    function importedColor(value, fallback = '#000000') {
+      const color = normalizedColor(value, fallback);
+      if (color.length !== 9) return color;
+
+      const red = parseInt(color.slice(1, 3), 16);
+      const green = parseInt(color.slice(3, 5), 16);
+      const blue = parseInt(color.slice(5, 7), 16);
+      const alpha = parseInt(color.slice(7, 9), 16) / 255;
+      return `rgba(${red}, ${green}, ${blue}, ${round(alpha)})`;
+    }
+
+    function importedTemplateDefinition(config, key) {
+      if (
+        !Array.isArray(config?.print_size)
+        || config.print_size[0] !== PRINT_WIDTH
+        || config.print_size[1] !== PRINT_HEIGHT
+      ) {
+        throw templateImportError(
+          `Размер конфига должен быть ${PRINT_WIDTH} × ${PRINT_HEIGHT} px`,
+          `Config size must be ${PRINT_WIDTH} × ${PRINT_HEIGHT} px`,
+        );
+      }
+
+      const template = config.templates?.[key];
+      const layout = template?.print_layout;
+      const defaultSize = template?.photo_size_px;
+      if (!template || !layout || typeof layout.background !== 'string') {
+        throw templateImportError('В конфиге нет выбранного макета', 'Selected layout is missing');
+      }
+      if (
+        layout.foreground
+        || template.photo_choice === true
+        || ![undefined, 'none'].includes(template.preview_rotation)
+        || ![undefined, 'none'].includes(template.preview_split)
+      ) {
+        throw templateImportError(
+          'Пока импортируются только обычные grid-макеты без foreground',
+          'Only regular grid layouts without a foreground can be imported for now',
+        );
+      }
+      if (
+        !Number.isInteger(defaultSize?.width)
+        || !Number.isInteger(defaultSize?.height)
+        || defaultSize.width < 1
+        || defaultSize.height < 1
+      ) {
+        throw templateImportError(
+          'В макете некорректный photo_size_px',
+          'The layout has an invalid photo_size_px',
+        );
+      }
+      if (
+        !Array.isArray(layout.photos)
+        || layout.photos.length < 1
+        || layout.photos.length > PHOTO_LAYOUT.maxPhotos
+      ) {
+        throw templateImportError(
+          `В макете должно быть от 1 до ${PHOTO_LAYOUT.maxPhotos} фотослотов`,
+          `The layout must contain 1 to ${PHOTO_LAYOUT.maxPhotos} photo slots`,
+        );
+      }
+
+      const photos = [...layout.photos]
+        .sort((left, right) => left.photo_index - right.photo_index)
+        .map((photo, index) => {
+          const width = photo.width ?? defaultSize.width;
+          const height = photo.height ?? defaultSize.height;
+          if (
+            photo.photo_index !== index
+            || photo.rotate !== 'none'
+            || ![photo.x, photo.y, width, height].every(Number.isInteger)
+            || photo.x < 0
+            || photo.y < 0
+            || width < 1
+            || height < 1
+            || photo.x + width > PRINT_WIDTH
+            || photo.y + height > PRINT_HEIGHT
+          ) {
+            throw templateImportError(
+              'Пока импортируются только grid/single без поворота и повторяющихся фото',
+              'Only non-rotated grid/single layouts without repeated photos can be imported',
+            );
+          }
+          return {
+            photo_index: index,
+            x: photo.x,
+            y: photo.y,
+            width,
+            height,
+          };
+        });
+
+      const rawTexts = layout.texts ?? [];
+      if (!Array.isArray(rawTexts)) {
+        throw templateImportError(
+          'Поле texts должно быть списком',
+          'The texts field must be an array',
+        );
+      }
+
+      const texts = rawTexts.map((block, index) => {
+        const position = block?.position;
+        if (
+          !block
+          || typeof block !== 'object'
+          || Array.isArray(block)
+          || Object.prototype.hasOwnProperty.call(block, 'lines')
+          || typeof block.text !== 'string'
+          || typeof block.font !== 'string'
+          || !FONT_FILE_PATTERN.test(block.font)
+          || block.font.includes('/')
+          || block.font.includes('\\')
+          || !Number.isInteger(block.size)
+          || block.size < 4
+          || block.size > 2000
+          || !Number.isInteger(position?.x)
+          || !Number.isInteger(position?.y)
+          || position.x < 0
+          || position.x > PRINT_WIDTH
+          || position.y < 0
+          || position.y > PRINT_HEIGHT
+        ) {
+          throw templateImportError(
+            `Некорректная подпись №${index + 1}`,
+            `Text object ${index + 1} is invalid`,
+          );
+        }
+
+        const align = ['left', 'center', 'right'].includes(block.align)
+          ? block.align
+          : 'center';
+        return {
+          ...block,
+          align,
+          angle: Number.isFinite(block.angle) ? block.angle : 0,
+          skewX: Number.isFinite(block.skew?.x) ? block.skew.x : 0,
+          skewY: Number.isFinite(block.skew?.y) ? block.skew.y : 0,
+          flipX: block.flip?.x === true,
+          flipY: block.flip?.y === true,
+          weight: Number.isInteger(block.weight) ? block.weight : 400,
+          color: importedColor(block.color),
+          strokeWidth: Number.isFinite(block.stroke_width)
+            ? Math.max(0, block.stroke_width)
+            : 0,
+          strokeColor: importedColor(block.stroke_color, block.color || '#000000'),
+          lineSpacing: Number.isFinite(block.line_spacing) ? block.line_spacing : 1.2,
+          charSpacing: Number.isFinite(block.char_spacing) ? block.char_spacing : 0,
+          underline: block.underline === true,
+          linethrough: block.linethrough === true,
+        };
+      });
+
+      const trim = config.print_trim || PRINT_TRIM;
+      if (
+        !['left', 'top', 'right', 'bottom'].every(side => (
+          Number.isInteger(trim[side]) && trim[side] >= 0
+        ))
+        || trim.left + trim.right >= PRINT_WIDTH
+        || trim.top + trim.bottom >= PRINT_HEIGHT
+      ) {
+        throw templateImportError('В конфиге некорректная обрезка', 'The config has invalid trim');
+      }
+
+      return {
+        key,
+        label: typeof template.label === 'string' && template.label.trim()
+          ? template.label.trim()
+          : key,
+        photos,
+        texts,
+        trim,
+      };
+    }
+
+    function onlineFamilyForFontFile(fileName) {
+      const stem = fileName.replace(FONT_FILE_PATTERN, '');
+
+      return [...onlineFontFamilies]
+        .sort((left, right) => right.length - left.length)
+        .find(family => {
+          const familyPattern = family
+            .split(/\s+/)
+            .map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+            .join('[ _-]*');
+          return new RegExp(`^${familyPattern}(?:[ _\\-\\[]|$)`, 'i').test(stem);
+        }) || null;
+    }
+
+    async function resolveImportedFonts(texts) {
+      const requests = new Map();
+      texts.forEach(block => {
+        if (!requests.has(block.font)) {
+          requests.set(block.font, block.weight);
+        }
+      });
+
+      const assets = new Map();
+      await Promise.all([...requests].map(async ([fileName, weight]) => {
+        let asset = fontAssets.get(fileName) || null;
+        const onlineFamily = asset ? null : onlineFamilyForFontFile(fileName);
+
+        if (!asset && onlineFamily) {
+          try {
+            asset = await cacheOnlineFont(
+              onlineFamily,
+              /italic/i.test(fileName) ? 'italic' : 'normal',
+              weight,
+            );
+          } catch (error) {
+            console.warn('[template-studio] online font was not found', fileName, error);
+          }
+        }
+        if (asset) assets.set(fileName, asset);
+      }));
+
+      return {
+        assets,
+        missing: [...requests.keys()].filter(fileName => !assets.has(fileName)),
+      };
+    }
+
+    function importedTextObject(block, asset) {
+      return new fabric.IText(block.text, {
+        left: block.position.x,
+        top: block.position.y,
+        originX: block.align,
+        originY: 'center',
+        textAlign: block.align,
+        angle: block.angle,
+        skewX: block.skewX,
+        skewY: block.skewY,
+        flipX: block.flipX,
+        flipY: block.flipY,
+        scaleX: 1,
+        scaleY: 1,
+        fontFamily: asset.family,
+        fontFile: asset.fileName,
+        fontStyle: asset.fontStyle || 'normal',
+        fontSize: block.size,
+        fontWeight: block.weight,
+        fill: block.color,
+        stroke: block.strokeColor,
+        strokeWidth: block.strokeWidth * 2,
+        lineHeight: block.lineSpacing,
+        charSpacing: block.charSpacing,
+        underline: block.underline,
+        linethrough: block.linethrough,
+        paintFirst: 'stroke',
+        centeredRotation: false,
+        strokeUniform: true,
+        styles: {},
+        kind: 'template-text',
+      });
     }
 
     function fontAssetForText(object) {
@@ -1449,44 +1741,270 @@
       return files;
     }
 
+    async function installUploadedFontFile(file) {
+      if (!FONT_FILE_PATTERN.test(file?.name || '') || !file?.size) {
+        throw templateImportError(
+          'Выберите непустой файл TTF или OTF',
+          'Choose a non-empty TTF or OTF file',
+        );
+      }
+
+      const duplicate = fontAssets.get(file.name);
+      if (duplicate) return duplicate;
+
+      const id = globalThis.crypto?.randomUUID?.()
+        || `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      return installFontAsset({
+        family: `TemplateFont_${id.replace(/[^a-z0-9]/gi, '')}`,
+        label: file.name.replace(FONT_FILE_PATTERN, ''),
+        fileName: file.name,
+        fileSize: file.size,
+        mimeType: file.type || 'font/ttf',
+        dataURL: await readFileAsDataURL(file),
+      });
+    }
+
+    function updateImportBackgroundHint() {
+      const key = importControls.key.value;
+      const expected = importConfig?.templates?.[key]?.print_layout?.background;
+      importControls.backgroundHint.textContent = expected
+        ? translate(`В конфиге: ${expected}`, `Configured file: ${expected}`)
+        : '';
+    }
+
+    async function applyImportedTemplate(definition, backgroundImage, backgroundFile, fonts) {
+      const canvas = imgEditor.canvas;
+      const previousRestoring = isRestoringDraft;
+      const previousHistoryProcessing = canvas.historyProcessing;
+      let completed = false;
+
+      isRestoringDraft = true;
+      canvas.historyProcessing = true;
+      try {
+        canvas.discardActiveObject();
+        canvas.getObjects().forEach(object => canvas.remove(object));
+        await installBackgroundImage(backgroundImage, {
+          fileName: backgroundFile.name,
+          fileSize: backgroundFile.size,
+        }, 'cover');
+
+        if (!imgEditor.setPrintTrimState(definition.trim)) {
+          throw templateImportError('Не удалось применить обрезку', 'Could not apply print trim');
+        }
+        if (!imgEditor.setPhotoLayoutState({
+          photos: definition.photos,
+          symmetry: { enabled: false },
+        })) {
+          throw templateImportError(
+            'Не удалось восстановить фотослоты',
+            'Could not restore photo slots',
+          );
+        }
+
+        definition.texts.forEach(block => {
+          const text = importedTextObject(block, fonts.get(block.font));
+          canvas.add(text);
+          text.setCoords();
+        });
+
+        exportControls.key.value = definition.key;
+        exportControls.label.value = definition.label;
+        imgEditor.activeSelection = null;
+        canvas.requestRenderAll();
+        imgEditor.fitZoom();
+        renderExportSummary();
+        completed = true;
+      } finally {
+        canvas.historyProcessing = previousHistoryProcessing;
+        isRestoringDraft = previousRestoring;
+      }
+
+      if (completed && !previousHistoryProcessing) {
+        canvas.clearHistory();
+        canvas._historySaveAction();
+      }
+      await flushDraftSave();
+    }
+
+    async function runTemplateImport() {
+      if (
+        !importConfig
+        || !importControls.key.value
+        || !importControls.background.files?.[0]
+      ) {
+        updateImportButton();
+        return;
+      }
+
+      importControls.run.classList.add('busy');
+      importControls.run.disabled = true;
+      setImportStatus(translate('Проверяю шаблон…', 'Checking template…'));
+
+      try {
+        const definition = importedTemplateDefinition(
+          importConfig,
+          importControls.key.value,
+        );
+        const resolvedFonts = await resolveImportedFonts(definition.texts);
+
+        if (resolvedFonts.missing.length) {
+          missingImportFonts = resolvedFonts.missing;
+          importControls.fonts.hidden = false;
+          setImportStatus(translate(
+            `Не найдены шрифты: ${missingImportFonts.join(', ')}`,
+            `Missing fonts: ${missingImportFonts.join(', ')}`,
+          ), 'error');
+          return;
+        }
+
+        clearMissingImportFonts();
+        const backgroundFile = importControls.background.files[0];
+        const validBackground = backgroundFile.size > 0 && (
+          BACKGROUND_TYPES.has((backgroundFile.type || '').toLowerCase())
+          || /\.(?:jpe?g|png|webp)$/i.test(backgroundFile.name)
+        );
+        if (!validBackground) {
+          throw templateImportError(
+            'Выберите непустой фон JPG, PNG или WEBP',
+            'Choose a non-empty JPG, PNG or WEBP background',
+          );
+        }
+
+        const source = await readFileAsDataURL(backgroundFile);
+        const backgroundImage = await loadFabricImage(source);
+        if (
+          backgroundImage.width !== PRINT_WIDTH
+          || backgroundImage.height !== PRINT_HEIGHT
+        ) {
+          throw templateImportError(
+            `Фон должен быть ${PRINT_WIDTH} × ${PRINT_HEIGHT} px`,
+            `Background must be ${PRINT_WIDTH} × ${PRINT_HEIGHT} px`,
+          );
+        }
+
+        await applyImportedTemplate(
+          definition,
+          backgroundImage,
+          backgroundFile,
+          resolvedFonts.assets,
+        );
+        setImportStatus(
+          translate(`Шаблон «${definition.label}» импортирован`, `“${definition.label}” imported`),
+          'success',
+        );
+        imgEditor.toast(
+          translate('Шаблон импортирован', 'Template imported'),
+          'Success',
+        );
+      } catch (error) {
+        console.error('[template-studio] import error', error);
+        setImportStatus(error.message, 'error');
+      } finally {
+        importControls.run.classList.remove('busy');
+        updateImportButton();
+      }
+    }
+
+    importControls.config.addEventListener('change', async event => {
+      const file = event.target.files?.[0];
+      importConfig = null;
+      importControls.key.replaceChildren();
+      importControls.choice.hidden = true;
+      importControls.backgroundHint.textContent = '';
+      clearMissingImportFonts();
+
+      if (!file) {
+        setImportStatus();
+        updateImportButton();
+        return;
+      }
+
+      try {
+        const config = JSON.parse(await file.text());
+        const keys = config?.templates
+          && typeof config.templates === 'object'
+          && !Array.isArray(config.templates)
+          ? Object.keys(config.templates)
+          : [];
+        if (!keys.length) {
+          throw templateImportError(
+            'В config.json нет шаблонов',
+            'config.json contains no templates',
+          );
+        }
+        if (
+          !Array.isArray(config.print_size)
+          || config.print_size[0] !== PRINT_WIDTH
+          || config.print_size[1] !== PRINT_HEIGHT
+        ) {
+          throw templateImportError(
+            `Размер конфига должен быть ${PRINT_WIDTH} × ${PRINT_HEIGHT} px`,
+            `Config size must be ${PRINT_WIDTH} × ${PRINT_HEIGHT} px`,
+          );
+        }
+
+        keys.forEach(key => {
+          const option = document.createElement('option');
+          const label = config.templates[key]?.label;
+          option.value = key;
+          option.textContent = label ? `${key} — ${label}` : key;
+          importControls.key.appendChild(option);
+        });
+        importControls.key.value = keys.includes('grid') ? 'grid' : keys[0];
+        importControls.choice.hidden = keys.length < 2;
+        importConfig = config;
+        updateImportBackgroundHint();
+        setImportStatus(translate(
+          `Конфиг прочитан: ${keys.length} макет(а)`,
+          `Config loaded: ${keys.length} layout(s)`,
+        ));
+      } catch (error) {
+        setImportStatus(error.message || translate(
+          'Не удалось прочитать config.json',
+          'Could not read config.json',
+        ), 'error');
+      }
+      updateImportButton();
+    });
+
+    importControls.key.addEventListener('change', () => {
+      clearMissingImportFonts();
+      updateImportBackgroundHint();
+      updateImportButton();
+    });
+    importControls.background.addEventListener('change', () => {
+      clearMissingImportFonts();
+      updateImportButton();
+    });
+    importControls.run.addEventListener('click', runTemplateImport);
+    importControls.fonts.addEventListener('click', () => {
+      importControls.fontInput.click();
+    });
+    importControls.fontInput.addEventListener('change', async event => {
+      const files = [...(event.target.files || [])];
+      event.target.value = '';
+      if (!files.length) return;
+
+      importControls.fonts.disabled = true;
+      try {
+        for (const file of files) {
+          await installUploadedFontFile(file);
+        }
+        await runTemplateImport();
+      } catch (error) {
+        setImportStatus(error.message, 'error');
+      } finally {
+        importControls.fonts.disabled = false;
+      }
+    });
+
     fontInput.addEventListener('change', async event => {
       const file = event.target.files?.[0];
       event.target.value = '';
       if (!file) return;
 
-      if (!FONT_FILE_PATTERN.test(file.name) || !file.size) {
-        imgEditor.toast(
-          translate('Выберите непустой файл TTF или OTF', 'Choose a non-empty TTF or OTF file'),
-          'Danger',
-          3000,
-        );
-        return;
-      }
-
-      const duplicate = [...fontAssets.values()].find(asset => asset.fileName === file.name);
-      if (duplicate) {
-        const object = imgEditor.activeSelection;
-        if (isTextObject(object)) {
-          imgEditor.applyTextFontAsset(object, duplicate);
-          imgEditor.canvas.requestRenderAll();
-          imgEditor.canvas.fire('object:property-realy-changed');
-          imgEditor.setSelectionValues();
-        }
-        return;
-      }
-
       try {
-        const id = globalThis.crypto?.randomUUID?.()
-          || `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-        const label = file.name.replace(FONT_FILE_PATTERN, '');
-        const asset = await installFontAsset({
-          family: `TemplateFont_${id.replace(/[^a-z0-9]/gi, '')}`,
-          label,
-          fileName: file.name,
-          fileSize: file.size,
-          mimeType: file.type || 'font/ttf',
-          dataURL: await readFileAsDataURL(file),
-        });
+        const asset = await installUploadedFontFile(file);
         const object = imgEditor.activeSelection;
 
         if (isTextObject(object)) {

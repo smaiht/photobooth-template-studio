@@ -1952,7 +1952,90 @@ select:focus-visible,
 
 .template-export-content {
     display: grid;
-    gap: 8px;
+    gap: 10px;
+}
+
+.template-import-section,
+.template-export-section {
+    display: grid;
+    gap: 9px;
+}
+
+.template-import-section h4,
+.template-export-section h4 {
+    margin: 0;
+}
+
+.template-transfer-divider {
+    width: 100%;
+    margin: 5px 0;
+    border: 0;
+    border-top: 1px solid var(--line);
+}
+
+.template-import-file {
+    display: grid;
+    gap: 5px;
+    color: #536075;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.template-import-file input[type="file"] {
+    width: 100%;
+    min-width: 0;
+    color: #657086;
+    font-size: 10px;
+    font-weight: 500;
+}
+
+.template-import-file input[type="file"]::file-selector-button {
+    min-height: 32px;
+    margin-right: 8px;
+    padding: 6px 10px;
+    color: #536075;
+    background: #fff;
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.template-import-file small {
+    color: #7b8698;
+    font-size: 10px;
+    font-weight: 500;
+    line-height: 1.35;
+}
+
+.template-import-status {
+    margin: 0;
+    padding: 9px 11px;
+    color: #526075;
+    background: var(--panel-muted);
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    font-size: 10px;
+    line-height: 1.45;
+}
+
+.template-import-status.error {
+    color: #a0444d;
+    background: #fff2f3;
+    border-color: #efc2c7;
+}
+
+.template-import-status.success {
+    color: #287050;
+    background: #effaf4;
+    border-color: #bde2cd;
+}
+
+#import-template-choice[hidden],
+#import-template-fonts[hidden],
+.template-import-status[hidden] {
+    display: none;
 }
 
 .template-export-summary {
@@ -2005,6 +2088,10 @@ select:focus-visible,
 
 .template-export-actions button:disabled {
     opacity: 0.55;
+    cursor: not-allowed;
+}
+
+.template-export-actions button.busy:disabled {
     cursor: wait;
 }
 
