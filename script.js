@@ -3,6 +3,8 @@
 
   const PRINT_WIDTH = 3688;
   const PRINT_HEIGHT = 2480;
+  const STRIP_WIDTH = PRINT_HEIGHT / 2;
+  const STRIP_HEIGHT = PRINT_WIDTH;
   const PRINT_TRIM = {
     left: 40,
     top: 50,
@@ -16,6 +18,7 @@
       {
         id: 'grid-2x2',
         label: '2 × 2',
+        profiles: ['grid'],
         aspectRatio: '3:2',
         slots: [
           { x: 312, y: 110, width: 1500, height: 1000 },
@@ -27,14 +30,51 @@
       {
         id: 'single',
         label: '1 большое',
+        profiles: ['grid'],
         aspectRatio: 'free',
         slots: [
           { x: 312, y: 110, width: 3050, height: 2050 },
         ],
       },
+      {
+        id: 'strips-4',
+        label: '4 фото',
+        profiles: ['strips'],
+        aspectRatio: '3:2',
+        slots: [
+          { x: 114, y: 129, width: 1068, height: 712 },
+          { x: 114, y: 900, width: 1068, height: 712 },
+          { x: 114, y: 1671, width: 1068, height: 712 },
+          { x: 114, y: 2442, width: 1068, height: 712 },
+        ],
+      },
     ],
   };
-  const DRAFT_KEY = 'current-project-v2';
+  const LAYOUT_PROFILES = {
+    grid: {
+      id: 'grid',
+      label: 'Грид',
+      width: PRINT_WIDTH,
+      height: PRINT_HEIGHT,
+      defaultPreset: 'grid-2x2',
+      symmetry: true,
+      column: false,
+    },
+    strips: {
+      id: 'strips',
+      label: 'Стрипсы',
+      width: STRIP_WIDTH,
+      height: STRIP_HEIGHT,
+      defaultPreset: 'strips-4',
+      symmetry: false,
+      column: true,
+    },
+  };
+  const DEFAULT_LAYOUT_LABELS = {
+    grid: 'Открытка',
+    strips: '2 полоски',
+  };
+  const DRAFT_KEY = 'current-project-v3';
   const BACKGROUND_TYPES = new Set([
     'image/jpeg',
     'image/png',
@@ -245,6 +285,118 @@
     });
   }
 
+  function mimeTypeForName(name) {
+    const extension = name.split('.').pop()?.toLowerCase();
+    return {
+      json: 'application/json',
+      png: 'image/png',
+      jpg: 'image/jpeg',
+      jpeg: 'image/jpeg',
+      webp: 'image/webp',
+      ttf: 'font/ttf',
+      otf: 'font/otf',
+    }[extension] || 'application/octet-stream';
+  }
+
+  function normalizedArchivePath(path) {
+    const normalized = String(path || '').replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!normalized || normalized.split('/').some(part => part === '..')) {
+      throw new Error('Invalid file path in template package');
+    }
+    return normalized;
+  }
+
+  async function inflateRaw(bytes) {
+    if (!globalThis.DecompressionStream) {
+      throw new Error('This browser cannot unpack compressed ZIP files');
+    }
+    const stream = new Blob([bytes]).stream().pipeThrough(
+      new DecompressionStream('deflate-raw'),
+    );
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+
+  async function unzipFiles(file) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const minimumEnd = Math.max(0, bytes.length - 65557);
+    let endOffset = -1;
+
+    for (let offset = bytes.length - 22; offset >= minimumEnd; offset -= 1) {
+      if (view.getUint32(offset, true) === 0x06054b50) {
+        endOffset = offset;
+        break;
+      }
+    }
+    if (endOffset === -1) {
+      throw new Error('ZIP central directory was not found');
+    }
+
+    const entryCount = view.getUint16(endOffset + 10, true);
+    let offset = view.getUint32(endOffset + 16, true);
+    const decoder = new TextDecoder('utf-8');
+    const files = new Map();
+
+    for (let index = 0; index < entryCount; index += 1) {
+      if (view.getUint32(offset, true) !== 0x02014b50) {
+        throw new Error('ZIP central directory is damaged');
+      }
+      const flags = view.getUint16(offset + 8, true);
+      const method = view.getUint16(offset + 10, true);
+      const checksum = view.getUint32(offset + 16, true);
+      const compressedSize = view.getUint32(offset + 20, true);
+      const unpackedSize = view.getUint32(offset + 24, true);
+      const nameLength = view.getUint16(offset + 28, true);
+      const extraLength = view.getUint16(offset + 30, true);
+      const commentLength = view.getUint16(offset + 32, true);
+      const localOffset = view.getUint32(offset + 42, true);
+      const name = normalizedArchivePath(decoder.decode(
+        bytes.subarray(offset + 46, offset + 46 + nameLength),
+      ));
+
+      offset += 46 + nameLength + extraLength + commentLength;
+      if (name.endsWith('/')) continue;
+      if (flags & 1) throw new Error('Encrypted ZIP files are not supported');
+      if (![0, 8].includes(method)) {
+        throw new Error(`ZIP compression method ${method} is not supported`);
+      }
+      if (view.getUint32(localOffset, true) !== 0x04034b50) {
+        throw new Error(`ZIP entry is damaged: ${name}`);
+      }
+      const localNameLength = view.getUint16(localOffset + 26, true);
+      const localExtraLength = view.getUint16(localOffset + 28, true);
+      const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
+      const compressed = bytes.subarray(dataOffset, dataOffset + compressedSize);
+      const data = method === 0 ? new Uint8Array(compressed) : await inflateRaw(compressed);
+
+      if (data.length !== unpackedSize || crc32(data) !== checksum) {
+        throw new Error(`ZIP entry is damaged: ${name}`);
+      }
+      files.set(name, data);
+    }
+    return files;
+  }
+
+  function folderFiles(fileList) {
+    const files = new Map();
+    [...fileList].forEach(file => {
+      const path = normalizedArchivePath(file.webkitRelativePath || file.name);
+      files.set(path, file);
+    });
+    return files;
+  }
+
+  async function packageFileBytes(value) {
+    return value instanceof Uint8Array
+      ? value
+      : new Uint8Array(await value.arrayBuffer());
+  }
+
+  async function packageFile(value, name) {
+    if (value instanceof File) return value;
+    return new File([value], name, { type: mimeTypeForName(name) });
+  }
+
   function downloadBlob(blob, fileName) {
     const link = document.createElement('a');
     const url = URL.createObjectURL(blob);
@@ -292,6 +444,15 @@
       sourceHeight: null,
       fitMode: 'cover',
     };
+    const layoutDocuments = {
+      grid: null,
+      strips: null,
+    };
+    const layoutLabels = { ...DEFAULT_LAYOUT_LABELS };
+    let activeLayout = 'grid';
+    let projectTrim = { ...PRINT_TRIM };
+    let projectName = 'template';
+    let isSwitchingLayout = false;
     let isRestoringDraft = true;
     let draftSaveTimer = null;
     let draftSaveQueue = Promise.resolve();
@@ -322,6 +483,136 @@
       templates: [],
       canvasSizeBlock: true,
     });
+
+    const layoutTabs = [...document.querySelectorAll('[data-layout-tab]')];
+    const canvasLayoutName = document.querySelector('#canvas-layout-name');
+    const canvasLayoutSize = document.querySelector('#canvas-layout-size');
+    const canvasContainer = imgEditor.canvas.upperCanvasEl.parentElement;
+    const canvasContent = canvasContainer.parentElement;
+
+    canvasContent.insertAdjacentHTML('beforeend', `
+      <div class="strip-pair-divider" hidden aria-hidden="true"></div>
+      <div class="strip-copy-preview" id="strip-copy-preview" hidden>
+        <canvas id="strip-copy-canvas"></canvas>
+        <div class="trim-preview-overlay strip-copy-trim-overlay" hidden>
+          <span class="trim-preview-zone trim-preview-left"></span>
+          <span class="trim-preview-zone trim-preview-top"></span>
+          <span class="trim-preview-zone trim-preview-right"></span>
+          <span class="trim-preview-zone trim-preview-bottom"></span>
+          <span class="trim-visible-frame"></span>
+        </div>
+      </div>
+    `);
+
+    const stripPairDivider = canvasContent.querySelector('.strip-pair-divider');
+    const stripCopyPreview = canvasContent.querySelector('#strip-copy-preview');
+    const stripCopyTrimOverlay = stripCopyPreview.querySelector('.strip-copy-trim-overlay');
+    const stripCopyCanvas = new fabric.StaticCanvas('strip-copy-canvas', {
+      enableRetinaScaling: imgEditor.canvas.enableRetinaScaling,
+      renderOnAddRemove: false,
+      selection: false,
+      skipOffscreen: false,
+    });
+
+    function setTrimCSS(element, trim) {
+      element.style.setProperty('--trim-left', `${(trim.left / STRIP_WIDTH) * 100}%`);
+      element.style.setProperty('--trim-top', `${(trim.top / STRIP_HEIGHT) * 100}%`);
+      element.style.setProperty('--trim-right', `${(trim.right / STRIP_WIDTH) * 100}%`);
+      element.style.setProperty('--trim-bottom', `${(trim.bottom / STRIP_HEIGHT) * 100}%`);
+    }
+
+    function rightStripTrim(trim = projectTrim) {
+      return {
+        left: 0,
+        top: trim.left,
+        right: trim.top,
+        bottom: trim.right,
+      };
+    }
+
+    function syncStripPairTrim() {
+      const state = imgEditor.getTrimPreviewState();
+      const showZones = activeLayout === 'strips' && state.visible && state.mode === 'zones';
+      const showCut = activeLayout === 'strips' && state.visible && state.mode === 'cut';
+
+      setTrimCSS(stripCopyPreview, rightStripTrim());
+      stripCopyTrimOverlay.hidden = !showZones;
+      stripCopyTrimOverlay.style.setProperty('--trim-color', state.color);
+      stripCopyTrimOverlay.style.setProperty('--trim-opacity', state.opacity / 100);
+      stripCopyPreview.classList.toggle('trim-cut-preview', showCut);
+    }
+
+    function renderStripCopy() {
+      if (activeLayout !== 'strips' || stripCopyPreview.hidden) return;
+
+      const sourceCanvas = imgEditor.canvas;
+      const zoom = sourceCanvas.getZoom();
+      const width = sourceCanvas.getWidth();
+      const height = sourceCanvas.getHeight();
+      stripCopyPreview.style.width = `${width}px`;
+      stripCopyPreview.style.height = `${height}px`;
+
+      if (stripCopyCanvas.getWidth() !== width || stripCopyCanvas.getHeight() !== height) {
+        stripCopyCanvas.setDimensions({ width, height });
+      }
+      stripCopyCanvas.cancelRequestedRender();
+      stripCopyCanvas.viewportTransform = [
+        -zoom,
+        0,
+        0,
+        zoom,
+        width,
+        0,
+      ];
+      stripCopyCanvas.backgroundColor = sourceCanvas.backgroundColor;
+      stripCopyCanvas.backgroundImage = sourceCanvas.backgroundImage;
+      const sourceObjects = sourceCanvas.getObjects();
+      const readableObjects = sourceObjects.filter(object => (
+        object.kind === 'photo-slot' || isTextObject(object)
+      ));
+
+      // The full strip is mirrored. Flip photo and text objects once more so
+      // their contents stay readable while their positions remain mirrored.
+      readableObjects.forEach(object => {
+        object.flipX = !object.flipX;
+      });
+      try {
+        stripCopyCanvas.renderCanvas(stripCopyCanvas.contextContainer, sourceObjects);
+      } finally {
+        readableObjects.forEach(object => {
+          object.flipX = !object.flipX;
+        });
+      }
+      stripCopyCanvas.cancelRequestedRender();
+    }
+
+    function setStripPairVisible(visible) {
+      stripPairDivider.hidden = !visible;
+      stripCopyPreview.hidden = !visible;
+      canvasContent.classList.toggle('strip-pair-active', visible);
+
+      if (visible) {
+        syncStripPairTrim();
+        renderStripCopy();
+      }
+    }
+
+    imgEditor.canvas.on('after:render', renderStripCopy);
+
+    function setLayoutTabsDisabled(disabled) {
+      layoutTabs.forEach(tab => {
+        tab.disabled = disabled;
+      });
+    }
+
+    LAYOUT_PROFILES.grid.help = translate(
+      'Стартовый 2 × 2 точно повторяет текущий grid-конфиг.',
+      'The initial 2 × 2 preset matches the current grid config.',
+    );
+    LAYOUT_PROFILES.strips.help = translate(
+      'Меняйте левую полосу. Справа сразу показывается готовая автоматическая копия.',
+      'Edit the left strip. The finished automatic copy is shown on the right.',
+    );
 
     const localFontOptions = document.querySelector(
       `${imgEditor.containerSelector} #local-font-options`,
@@ -750,34 +1041,309 @@
         'photoSymmetryEnabled',
         'photoSymmetryOffsetX',
         'photoSymmetryOffsetY',
+        'photoColumnEnabled',
+        'photoColumnGap',
         'fontFile',
       ]);
     }
 
-    async function saveCurrentDraft() {
-      if (isRestoringDraft) {
+    function activeProfile() {
+      return LAYOUT_PROFILES[activeLayout];
+    }
+
+    function leftStripTrim(trim = projectTrim) {
+      return {
+        left: trim.bottom,
+        top: trim.left,
+        right: 0,
+        bottom: trim.right,
+      };
+    }
+
+    function emptyBackgroundState() {
+      return {
+        fileName: null,
+        fileSize: null,
+        sourceWidth: null,
+        sourceHeight: null,
+        fitMode: 'cover',
+      };
+    }
+
+    function defaultBackgroundFillState() {
+      return {
+        type: 'color',
+        color: '#ffffff',
+        gradient: {
+          type: 'linear',
+          angle: 0,
+          stops: [
+            { color: '#ffffff', position: 0 },
+            { color: '#6d5dfc', position: 100 },
+          ],
+        },
+      };
+    }
+
+    function setCanvasProfile(layout) {
+      const profile = LAYOUT_PROFILES[layout];
+      const canvas = imgEditor.canvas;
+      const isGrid = layout === 'grid';
+
+      canvas.setZoom(1);
+      canvas.originalW = profile.width;
+      canvas.originalH = profile.height;
+      canvas.setDimensions({ width: profile.width, height: profile.height });
+      canvas.calcOffset();
+      imgEditor.dimensions = { width: profile.width, height: profile.height };
+      imgEditor.setPhotoLayoutProfile(isGrid ? profile : {
+        ...profile,
+        pairedTrim: rightStripTrim(),
+      });
+
+      imgEditor.setTrimContext({
+        width: profile.width,
+        height: profile.height,
+        trim: isGrid ? projectTrim : leftStripTrim(),
+        editable: isGrid,
+        display: isGrid ? null : {
+          width: PRINT_WIDTH,
+          height: PRINT_HEIGHT,
+          trim: projectTrim,
+        },
+        note: isGrid
+          ? ''
+          : translate(
+            'Ниже показаны все 4 trim края полного печатного листа. На холсте редактируется левая полоса; внутренняя линия разреза не является trim.',
+            'All 4 trim edges below belong to the complete print sheet. The canvas edits the left strip; its inner cut line is not a trim edge.',
+          ),
+      });
+      imgEditor.syncPhotoLayoutMeasurements?.();
+      setStripPairVisible(!isGrid);
+
+      canvasLayoutName.textContent = translate(profile.label, profile.id === 'grid' ? 'Grid' : 'Strips');
+      canvasLayoutSize.textContent = `${profile.width} × ${profile.height}`;
+      layoutTabs.forEach(tab => {
+        const selected = tab.dataset.layoutTab === layout;
+        tab.classList.toggle('active', selected);
+        tab.setAttribute('aria-selected', String(selected));
+      });
+    }
+
+    function captureActiveLayout() {
+      if (!imgEditor.canvas || isSwitchingLayout) {
         return;
       }
 
-      await window.saveInBrowser.save(DRAFT_KEY, {
-        version: 2,
-        savedAt: Date.now(),
+      if (activeLayout === 'grid') {
+        const trim = imgEditor.getPrintTrimState();
+        projectTrim = {
+          left: trim.left,
+          top: trim.top,
+          right: trim.right,
+          bottom: trim.bottom,
+        };
+      }
+
+      layoutDocuments[activeLayout] = {
         canvas: canvasDraftJSON(),
         backgroundFill: imgEditor.getBackgroundFillState(),
-        printTrim: imgEditor.getPrintTrimState(),
         trimPreview: imgEditor.getTrimPreviewState(),
         photoLayoutView: imgEditor.getPhotoLayoutViewState(),
-        fonts: [...fontAssets.values()].filter(asset => asset.source !== 'bundled'),
-        templateExport: {
-          key: document.querySelector('#export-template-key')?.value || 'grid',
-          label: document.querySelector('#export-template-label')?.value || '',
+        background: { ...backgroundState },
+        historyUndo: [...(imgEditor.canvas.historyUndo || [])],
+        historyRedo: [...(imgEditor.canvas.historyRedo || [])],
+      };
+    }
+
+    function persistedLayout(documentState) {
+      if (!documentState) return null;
+
+      return {
+        canvas: documentState.canvas,
+        backgroundFill: documentState.backgroundFill,
+        trimPreview: documentState.trimPreview,
+        photoLayoutView: documentState.photoLayoutView,
+        background: documentState.background,
+      };
+    }
+
+    function clearCanvasDocument() {
+      const canvas = imgEditor.canvas;
+      canvas.discardActiveObject();
+      canvas.getObjects().forEach(object => canvas.remove(object));
+      canvas.backgroundImage = null;
+      canvas.overlayImage = null;
+      canvas.setBackgroundColor('#ffffff');
+    }
+
+    function emptyLayoutDocument() {
+      return {
+        canvas: {
+          version: fabric.version,
+          objects: [],
+          background: '#ffffff',
         },
+        backgroundFill: defaultBackgroundFillState(),
+        trimPreview: {
+          visible: false,
+          mode: 'zones',
+          color: '#ff2d55',
+          opacity: 75,
+        },
+        photoLayoutView: {
+          visible: true,
+          axesVisible: false,
+          editing: false,
+        },
+        background: emptyBackgroundState(),
+        historyUndo: [],
+        historyRedo: [],
+      };
+    }
+
+    async function loadLayout(layout) {
+      const canvas = imgEditor.canvas;
+      const documentState = layoutDocuments[layout];
+      const previousHistoryProcessing = canvas.historyProcessing;
+
+      isSwitchingLayout = true;
+      canvas.historyProcessing = true;
+      activeLayout = layout;
+      try {
+        setCanvasProfile(layout);
+        clearCanvasDocument();
+
+        if (documentState?.canvas) {
+          await restoreOnlineFonts(documentState.canvas);
+          await loadCanvasJSON(documentState.canvas);
+          imgEditor.syncPhotoLayout(false);
+          imgEditor.setBackgroundFillState(documentState.backgroundFill);
+          imgEditor.setPhotoLayoutViewState(documentState.photoLayoutView);
+          imgEditor.setTrimPreviewState(documentState.trimPreview);
+          Object.assign(backgroundState, emptyBackgroundState(), documentState.background);
+        } else {
+          imgEditor.setBackgroundFillState(defaultBackgroundFillState());
+          imgEditor.resetPhotoLayout(false);
+          imgEditor.setPhotoLayoutViewState({
+            visible: true,
+            axesVisible: true,
+            editing: false,
+          });
+          imgEditor.setTrimPreviewState({ visible: false, mode: 'zones' });
+          Object.assign(backgroundState, emptyBackgroundState());
+        }
+
+        imgEditor.activeSelection = null;
+        canvas.discardActiveObject();
+        canvas.requestRenderAll();
+        imgEditor.fitZoom();
+        renderBackgroundControls();
+        syncStripPairTrim();
+        renderStripCopy();
+      } finally {
+        canvas.historyProcessing = previousHistoryProcessing;
+        isSwitchingLayout = false;
+      }
+
+      if (documentState?.historyUndo?.length) {
+        canvas.historyUndo = [...documentState.historyUndo];
+        canvas.historyRedo = [...(documentState.historyRedo || [])];
+      } else {
+        canvas.clearHistory();
+        canvas._historySaveAction();
+      }
+      captureActiveLayout();
+    }
+
+    imgEditor.clearProject = async () => {
+      if (isSwitchingLayout) return;
+
+      const previousRestoringDraft = isRestoringDraft;
+      let cleared = false;
+      clearTimeout(draftSaveTimer);
+      setLayoutTabsDisabled(true);
+      isRestoringDraft = true;
+
+      try {
+        projectTrim = { ...PRINT_TRIM };
+        projectName = 'template';
+        Object.assign(layoutLabels, DEFAULT_LAYOUT_LABELS);
+        Object.keys(layoutDocuments).forEach(layout => {
+          layoutDocuments[layout] = emptyLayoutDocument();
+        });
+
+        backgroundInput.value = '';
+        importFiles = null;
+        importControls.package.value = '';
+        importControls.folder.value = '';
+        importControls.fontInput.value = '';
+        clearMissingImportFonts();
+        setImportStatus();
+        exportControls.name.value = projectName;
+        await loadLayout(activeLayout);
+        imgEditor.setActiveTool('select');
+        renderExportSummary();
+        cleared = true;
+      } catch (error) {
+        console.error('[template-studio] could not clear project', error);
+        imgEditor.toast(
+          translate('Не удалось очистить проект', 'Could not clear the project'),
+          'Danger',
+          3500,
+        );
+      } finally {
+        isRestoringDraft = previousRestoringDraft;
+        setLayoutTabsDisabled(false);
+      }
+
+      if (cleared && !isRestoringDraft) {
+        await flushDraftSave();
+        imgEditor.toast(
+          translate('Проект очищен', 'Project cleared'),
+          'Success',
+        );
+      }
+    };
+
+    async function switchLayout(layout, saveDraft = true) {
+      if (!LAYOUT_PROFILES[layout] || layout === activeLayout || isSwitchingLayout) {
+        return;
+      }
+
+      captureActiveLayout();
+      await loadLayout(layout);
+      renderExportSummary();
+      if (saveDraft) {
+        queueDraftSave();
+      }
+    }
+
+    async function saveCurrentDraft() {
+      if (isRestoringDraft || isSwitchingLayout) {
+        return;
+      }
+
+      captureActiveLayout();
+
+      await window.saveInBrowser.save(DRAFT_KEY, {
+        version: 3,
+        savedAt: Date.now(),
+        activeLayout,
+        projectName,
+        printTrim: projectTrim,
+        layoutLabels: { ...layoutLabels },
+        layouts: {
+          grid: persistedLayout(layoutDocuments.grid),
+          strips: persistedLayout(layoutDocuments.strips),
+        },
+        fonts: [...fontAssets.values()].filter(asset => asset.source !== 'bundled'),
       });
       draftSaveErrorShown = false;
     }
 
     function queueDraftSave() {
-      if (isRestoringDraft) {
+      if (isRestoringDraft || isSwitchingLayout) {
         return;
       }
 
@@ -833,56 +1399,37 @@
     async function restoreDraft() {
       const draft = await window.saveInBrowser.load(DRAFT_KEY);
 
-      if (!draft || draft.version !== 2 || !draft.canvas) {
+      if (!draft || draft.version !== 3 || !draft.layouts) {
         return false;
       }
 
-      imgEditor.canvas.historyProcessing = true;
-
-      try {
-        await restoreFontAssets(draft.fonts);
-        await restoreOnlineFonts(draft.canvas);
-        await loadCanvasJSON(draft.canvas);
-        imgEditor.syncPhotoLayout();
-        imgEditor.setPhotoLayoutViewState(draft.photoLayoutView);
-        imgEditor.setBackgroundFillState(draft.backgroundFill);
-        imgEditor.setPrintTrimState(draft.printTrim);
-        imgEditor.setTrimPreviewState(draft.trimPreview);
-        if (draft.templateExport) {
-          exportControls.key.value = draft.templateExport.key || 'grid';
-          exportControls.label.value = draft.templateExport.label || '';
+      await restoreFontAssets(draft.fonts);
+      projectTrim = { ...PRINT_TRIM, ...draft.printTrim };
+      projectName = typeof draft.projectName === 'string' && draft.projectName
+        ? draft.projectName
+        : 'template';
+      for (const layout of Object.keys(layoutLabels)) {
+        const label = draft.layoutLabels?.[layout];
+        if (typeof label === 'string' && label.trim()) {
+          layoutLabels[layout] = label.trim();
         }
-
-        const backgroundImage = imgEditor.canvas.backgroundImage;
-
-        Object.assign(backgroundState, {
-          fileName: backgroundImage?.assetFileName
-            || (backgroundImage
-              ? translate('Фоновое изображение', 'Background image')
-              : null),
-          fileSize: backgroundImage?.assetFileSize || null,
-          sourceWidth: backgroundImage?.width || null,
-          sourceHeight: backgroundImage?.height || null,
-          fitMode: ['cover', 'stretch'].includes(backgroundImage?.backgroundFitMode)
-            ? backgroundImage.backgroundFitMode
-            : 'cover',
-        });
-
-        imgEditor.canvas.requestRenderAll();
-        imgEditor.fitZoom();
-        renderBackgroundControls();
-      } finally {
-        imgEditor.canvas.historyProcessing = false;
-        imgEditor.canvas.clearHistory();
-        imgEditor.canvas._historySaveAction();
       }
+      for (const layout of Object.keys(layoutDocuments)) {
+        const saved = draft.layouts[layout];
+        layoutDocuments[layout] = saved
+          ? { ...saved, historyUndo: [], historyRedo: [] }
+          : null;
+      }
+      activeLayout = LAYOUT_PROFILES[draft.activeLayout] ? draft.activeLayout : 'grid';
+      await loadLayout(activeLayout);
 
       return true;
     }
 
     function applyBackgroundFit(image, fitMode) {
-      const widthScale = PRINT_WIDTH / image.width;
-      const heightScale = PRINT_HEIGHT / image.height;
+      const { width, height } = activeProfile();
+      const widthScale = width / image.width;
+      const heightScale = height / image.height;
       const scaleX = fitMode === 'stretch'
         ? widthScale
         : Math.max(widthScale, heightScale);
@@ -893,8 +1440,8 @@
       image.set({
         originX: 'center',
         originY: 'center',
-        left: PRINT_WIDTH / 2,
-        top: PRINT_HEIGHT / 2,
+        left: width / 2,
+        top: height / 2,
         scaleX,
         scaleY,
         angle: 0,
@@ -930,6 +1477,7 @@
       imgEditor.canvas.requestRenderAll();
       imgEditor.fitZoom();
       renderBackgroundControls();
+      imgEditor.canvas.fire('background:modified');
 
       if (!isRestoringDraft) {
         await flushDraftSave();
@@ -937,13 +1485,14 @@
 
       console.info('[template-studio] background loaded', {
         sourceSize: [image.width, image.height],
-        printSize: [PRINT_WIDTH, PRINT_HEIGHT],
+        canvasSize: [activeProfile().width, activeProfile().height],
         fitMode,
         scale: [scales.scaleX, scales.scaleY],
       });
     }
 
     function chooseBackgroundFit(file, image) {
+      const { width, height } = activeProfile();
       const previousFocus = document.activeElement;
       const dialog = document.createElement('div');
       dialog.className = 'background-fit-dialog';
@@ -990,8 +1539,8 @@
         </div>
       `;
       dialog.querySelector('.background-fit-source').textContent = translate(
-        `${file.name}: ${image.width} × ${image.height} px, макет: ${PRINT_WIDTH} × ${PRINT_HEIGHT} px`,
-        `${file.name}: ${image.width} × ${image.height} px, canvas: ${PRINT_WIDTH} × ${PRINT_HEIGHT} px`,
+        `${file.name}: ${image.width} × ${image.height} px, макет: ${width} × ${height} px`,
+        `${file.name}: ${image.width} × ${image.height} px, canvas: ${width} × ${height} px`,
       );
       document.body.appendChild(dialog);
 
@@ -1052,6 +1601,7 @@
     }
 
     async function setBackgroundFile(file) {
+      const { width, height } = activeProfile();
       const mimeType = (file.type || '').toLowerCase();
       const hasKnownExtension = /\.(?:jpe?g|png|webp)$/i.test(file.name);
       const isSupported = BACKGROUND_TYPES.has(mimeType) || hasKnownExtension;
@@ -1072,7 +1622,7 @@
 
       try {
         image = await loadFabricImage(source);
-      } catch (error) {
+      } catch {
         throw new Error(translate(
           'Не удалось прочитать изображение',
           'Could not decode the image',
@@ -1080,8 +1630,8 @@
       }
 
       let fitMode = 'cover';
-      const dimensionsMatch = image.width === PRINT_WIDTH
-        && image.height === PRINT_HEIGHT;
+      const dimensionsMatch = image.width === width
+        && image.height === height;
 
       if (!dimensionsMatch) {
         fitMode = await chooseBackgroundFit(file, image);
@@ -1110,7 +1660,7 @@
       backgroundState.fitMode = fitMode;
       imgEditor.canvas.requestRenderAll();
       renderBackgroundControls();
-      queueDraftSave();
+      imgEditor.canvas.fire('background:modified');
     }
 
     function removeBackground() {
@@ -1127,7 +1677,7 @@
       });
 
       renderBackgroundControls();
-      queueDraftSave();
+      imgEditor.canvas.fire('background:modified');
       imgEditor.toast(
         translate('Фоновое изображение удалено', 'Background image removed'),
         'Success',
@@ -1146,24 +1696,22 @@
     renderBackgroundControls();
 
     const exportControls = {
-      key: document.querySelector('#export-template-key'),
-      label: document.querySelector('#export-template-label'),
+      name: document.querySelector('#export-template-name'),
       summary: document.querySelector('#template-export-summary'),
       config: document.querySelector('#download-template-config'),
+      gridBackground: document.querySelector('#download-template-grid-background'),
+      stripBackground: document.querySelector('#download-template-strip-background'),
       package: document.querySelector('#download-template-package'),
     };
     const importControls = {
-      config: document.querySelector('#import-template-config'),
-      background: document.querySelector('#import-template-background'),
-      choice: document.querySelector('#import-template-choice'),
-      key: document.querySelector('#import-template-key'),
-      backgroundHint: document.querySelector('#import-template-background-hint'),
-      run: document.querySelector('#import-template-run'),
+      package: document.querySelector('#import-template-package'),
+      folder: document.querySelector('#import-template-folder'),
       fonts: document.querySelector('#import-template-fonts'),
       fontInput: document.querySelector('#import-template-font-input'),
       status: document.querySelector('#import-template-status'),
     };
-    let importConfig = null;
+    let importFiles = null;
+    let importBusy = false;
     let missingImportFonts = [];
 
     function isTextObject(object) {
@@ -1233,15 +1781,6 @@
       importControls.fonts.hidden = true;
     }
 
-    function updateImportButton() {
-      importControls.run.disabled = (
-        importControls.run.classList.contains('busy')
-        || !importConfig
-        || !importControls.key.value
-        || !importControls.background.files?.[0]
-      );
-    }
-
     function importedColor(value, fallback = '#000000') {
       const color = normalizedColor(value, fallback);
       if (color.length !== 9) return color;
@@ -1253,7 +1792,7 @@
       return `rgba(${red}, ${green}, ${blue}, ${round(alpha)})`;
     }
 
-    function importedTemplateDefinition(config, key) {
+    function validatedImportedConfig(config) {
       if (
         !Array.isArray(config?.print_size)
         || config.print_size[0] !== PRINT_WIDTH
@@ -1265,6 +1804,85 @@
         );
       }
 
+      const trim = config.print_trim || PRINT_TRIM;
+      if (
+        !['left', 'top', 'right', 'bottom'].every(side => (
+          Number.isInteger(trim[side]) && trim[side] >= 0
+        ))
+        || trim.left + trim.right >= PRINT_WIDTH
+        || trim.top + trim.bottom >= PRINT_HEIGHT
+      ) {
+        throw templateImportError('В конфиге некорректная обрезка', 'The config has invalid trim');
+      }
+      if (!config.templates?.grid || !config.templates?.strips) {
+        throw templateImportError(
+          'В шаблоне должны быть макеты grid и strips',
+          'The template must contain grid and strips layouts',
+        );
+      }
+      return trim;
+    }
+
+    function normalizedAngle(value) {
+      const angle = ((Number(value) || 0) + 180) % 360;
+      return round((angle < 0 ? angle + 360 : angle) - 180);
+    }
+
+    function importedTextBlock(block, index, width, height) {
+      const position = block?.position;
+      if (
+        !block
+        || typeof block !== 'object'
+        || Array.isArray(block)
+        || Object.prototype.hasOwnProperty.call(block, 'lines')
+        || typeof block.text !== 'string'
+        || typeof block.font !== 'string'
+        || !FONT_FILE_PATTERN.test(block.font)
+        || block.font.includes('/')
+        || block.font.includes('\\')
+        || !Number.isInteger(block.size)
+        || block.size < 4
+        || block.size > 2000
+        || !Number.isInteger(position?.x)
+        || !Number.isInteger(position?.y)
+        || position.x < 0
+        || position.x > width
+        || position.y < 0
+        || position.y > height
+      ) {
+        throw templateImportError(
+          `Некорректная подпись №${index + 1}`,
+          `Text object ${index + 1} is invalid`,
+        );
+      }
+
+      const align = ['left', 'center', 'right'].includes(block.align)
+        ? block.align
+        : 'center';
+      return {
+        ...block,
+        align,
+        angle: Number.isFinite(block.angle) ? block.angle : 0,
+        skewX: Number.isFinite(block.skew?.x) ? block.skew.x : 0,
+        skewY: Number.isFinite(block.skew?.y) ? block.skew.y : 0,
+        flipX: block.flip?.x === true,
+        flipY: block.flip?.y === true,
+        weight: Number.isInteger(block.weight) ? block.weight : 400,
+        color: importedColor(block.color),
+        strokeWidth: Number.isFinite(block.stroke_width)
+          ? Math.max(0, block.stroke_width)
+          : 0,
+        strokeColor: importedColor(block.stroke_color, block.color || '#000000'),
+        lineSpacing: Number.isFinite(block.line_spacing) ? block.line_spacing : 1.2,
+        charSpacing: Number.isFinite(block.char_spacing) ? block.char_spacing : 0,
+        underline: block.underline === true,
+        linethrough: block.linethrough === true,
+      };
+    }
+
+    function importedGridDefinition(config) {
+      const key = 'grid';
+
       const template = config.templates?.[key];
       const layout = template?.print_layout;
       const defaultSize = template?.photo_size_px;
@@ -1272,14 +1890,13 @@
         throw templateImportError('В конфиге нет выбранного макета', 'Selected layout is missing');
       }
       if (
-        layout.foreground
-        || template.photo_choice === true
+        template.photo_choice === true
         || ![undefined, 'none'].includes(template.preview_rotation)
         || ![undefined, 'none'].includes(template.preview_split)
       ) {
         throw templateImportError(
-          'Пока импортируются только обычные grid-макеты без foreground',
-          'Only regular grid layouts without a foreground can be imported for now',
+          'Некорректные настройки preview у grid',
+          'The grid preview settings are invalid',
         );
       }
       if (
@@ -1342,68 +1959,9 @@
         );
       }
 
-      const texts = rawTexts.map((block, index) => {
-        const position = block?.position;
-        if (
-          !block
-          || typeof block !== 'object'
-          || Array.isArray(block)
-          || Object.prototype.hasOwnProperty.call(block, 'lines')
-          || typeof block.text !== 'string'
-          || typeof block.font !== 'string'
-          || !FONT_FILE_PATTERN.test(block.font)
-          || block.font.includes('/')
-          || block.font.includes('\\')
-          || !Number.isInteger(block.size)
-          || block.size < 4
-          || block.size > 2000
-          || !Number.isInteger(position?.x)
-          || !Number.isInteger(position?.y)
-          || position.x < 0
-          || position.x > PRINT_WIDTH
-          || position.y < 0
-          || position.y > PRINT_HEIGHT
-        ) {
-          throw templateImportError(
-            `Некорректная подпись №${index + 1}`,
-            `Text object ${index + 1} is invalid`,
-          );
-        }
-
-        const align = ['left', 'center', 'right'].includes(block.align)
-          ? block.align
-          : 'center';
-        return {
-          ...block,
-          align,
-          angle: Number.isFinite(block.angle) ? block.angle : 0,
-          skewX: Number.isFinite(block.skew?.x) ? block.skew.x : 0,
-          skewY: Number.isFinite(block.skew?.y) ? block.skew.y : 0,
-          flipX: block.flip?.x === true,
-          flipY: block.flip?.y === true,
-          weight: Number.isInteger(block.weight) ? block.weight : 400,
-          color: importedColor(block.color),
-          strokeWidth: Number.isFinite(block.stroke_width)
-            ? Math.max(0, block.stroke_width)
-            : 0,
-          strokeColor: importedColor(block.stroke_color, block.color || '#000000'),
-          lineSpacing: Number.isFinite(block.line_spacing) ? block.line_spacing : 1.2,
-          charSpacing: Number.isFinite(block.char_spacing) ? block.char_spacing : 0,
-          underline: block.underline === true,
-          linethrough: block.linethrough === true,
-        };
-      });
-
-      const trim = config.print_trim || PRINT_TRIM;
-      if (
-        !['left', 'top', 'right', 'bottom'].every(side => (
-          Number.isInteger(trim[side]) && trim[side] >= 0
-        ))
-        || trim.left + trim.right >= PRINT_WIDTH
-        || trim.top + trim.bottom >= PRINT_HEIGHT
-      ) {
-        throw templateImportError('В конфиге некорректная обрезка', 'The config has invalid trim');
-      }
+      const texts = rawTexts.map((block, index) => (
+        importedTextBlock(block, index, PRINT_WIDTH, PRINT_HEIGHT)
+      ));
 
       return {
         key,
@@ -1412,7 +1970,111 @@
           : key,
         photos,
         texts,
-        trim,
+        background: layout.background,
+        foreground: layout.foreground || null,
+      };
+    }
+
+    function importedStripsDefinition(config) {
+      const key = 'strips';
+      const template = config.templates?.[key];
+      const layout = template?.print_layout;
+      const defaultSize = template?.photo_size_px;
+      if (!template || !layout || typeof layout.background !== 'string') {
+        throw templateImportError('В конфиге нет макета strips', 'The strips layout is missing');
+      }
+      if (
+        template.photo_choice === true
+        || template.preview_rotation !== 'cw'
+        || template.preview_split !== 'horizontal'
+      ) {
+        throw templateImportError(
+          'Некорректные настройки preview у strips',
+          'The strips preview settings are invalid',
+        );
+      }
+      if (
+        !Number.isInteger(defaultSize?.width)
+        || !Number.isInteger(defaultSize?.height)
+        || defaultSize.width < 1
+        || defaultSize.height < 1
+        || !Array.isArray(layout.photos)
+        || !layout.photos.length
+      ) {
+        throw templateImportError(
+          'В strips некорректные размеры или фотослоты',
+          'The strips photo size or slots are invalid',
+        );
+      }
+
+      const leftPhotos = layout.photos.map((photo, index) => {
+        const width = photo?.width ?? defaultSize.width;
+        const height = photo?.height ?? defaultSize.height;
+        if (
+          !photo
+          || !Number.isInteger(photo.photo_index)
+          || photo.photo_index < 0
+          || photo.rotate !== 'ccw'
+          || ![photo.x, photo.y, width, height].every(Number.isInteger)
+          || photo.x < 0
+          || photo.y < 0
+          || width < 1
+          || height < 1
+          || photo.x + width > PRINT_WIDTH
+          || photo.y + height > PRINT_HEIGHT
+        ) {
+          throw templateImportError(
+            `Некорректный фотослот strips №${index + 1}`,
+            `Strips photo slot ${index + 1} is invalid`,
+          );
+        }
+
+        return {
+          photo_index: photo.photo_index,
+          x: PRINT_HEIGHT - photo.y - height,
+          y: photo.x,
+          width: height,
+          height: width,
+        };
+      }).filter(photo => photo.x >= 0 && photo.x + photo.width <= STRIP_WIDTH);
+
+      leftPhotos.sort((left, right) => left.photo_index - right.photo_index);
+      if (
+        !leftPhotos.length
+        || leftPhotos.length > PHOTO_LAYOUT.maxPhotos
+        || leftPhotos.some((photo, index) => photo.photo_index !== index)
+      ) {
+        throw templateImportError(
+          'Не удалось найти последовательные фотослоты левой полосы',
+          'Could not find consecutive photo slots on the left strip',
+        );
+      }
+
+      const rawTexts = layout.texts ?? [];
+      if (!Array.isArray(rawTexts)) {
+        throw templateImportError('Поле texts должно быть списком', 'The texts field must be an array');
+      }
+      const texts = rawTexts
+        .map((block, index) => importedTextBlock(block, index, PRINT_WIDTH, PRINT_HEIGHT))
+        .map(block => ({
+          ...block,
+          position: {
+            x: PRINT_HEIGHT - block.position.y,
+            y: block.position.x,
+          },
+          angle: normalizedAngle(block.angle + 90),
+        }))
+        .filter(block => block.position.x >= 0 && block.position.x <= STRIP_WIDTH);
+
+      return {
+        key,
+        label: typeof template.label === 'string' && template.label.trim()
+          ? template.label.trim()
+          : key,
+        photos: leftPhotos,
+        texts,
+        background: layout.background,
+        foreground: layout.foreground || null,
       };
     }
 
@@ -1510,7 +2172,7 @@
       return asset;
     }
 
-    function exportTextBlock(object, usedFonts) {
+    function exportTextBlock(object, usedFonts, width, height) {
       imgEditor.normalizeTextScale?.(object);
       object.set({ styles: {}, strokeUniform: true });
 
@@ -1520,9 +2182,9 @@
       const anchor = object.getPointByOrigin(align, 'center');
       if (
         anchor.x < 0
-        || anchor.x > PRINT_WIDTH
+        || anchor.x > width
         || anchor.y < 0
-        || anchor.y > PRINT_HEIGHT
+        || anchor.y > height
       ) {
         const sample = String(object.text || '').replace(/\s+/g, ' ').slice(0, 32);
         throw new Error(translate(
@@ -1571,44 +2233,143 @@
     }
 
     function exportSettings() {
-      const key = exportControls.key.value.trim();
-      const label = exportControls.label.value.trim() || translate('Открытка', 'Grid');
-
-      if (!/^[a-z0-9_-]+$/i.test(key)) {
+      const name = exportControls.name.value.trim();
+      if (!/^[a-z0-9_-]+$/i.test(name)) {
         throw new Error(translate(
-          'Ключ шаблона: только латиница, цифры, _ и -',
-          'Template key may contain only letters, numbers, _ and -',
+          'Имя ZIP: только латиница, цифры, _ и -',
+          'ZIP name may contain only letters, numbers, _ and -',
         ));
       }
-      return { key, label };
+      projectName = name;
+      return { name };
     }
 
-    function buildTemplateConfig() {
-      const { key, label } = exportSettings();
+    function printTrimConfig() {
+      const trim = {
+        left: Math.round(Number(projectTrim.left) || 0),
+        top: Math.round(Number(projectTrim.top) || 0),
+        right: Math.round(Number(projectTrim.right) || 0),
+        bottom: Math.round(Number(projectTrim.bottom) || 0),
+      };
+      trim.visible_size = [
+        PRINT_WIDTH - trim.left - trim.right,
+        PRINT_HEIGHT - trim.top - trim.bottom,
+      ];
+      return trim;
+    }
+
+    function activeStaticLayers() {
+      const objects = imgEditor.canvas.getObjects();
+      const slotIndexes = objects
+        .map((object, index) => (object.kind === 'photo-slot' ? index : -1))
+        .filter(index => index !== -1);
+      const firstSlot = slotIndexes.length ? Math.min(...slotIndexes) : objects.length;
+      const lastSlot = slotIndexes.length ? Math.max(...slotIndexes) : objects.length - 1;
+      const isStatic = object => (
+        !object.excludeFromExport
+        && object.kind !== 'photo-slot'
+        && !isTextObject(object)
+      );
+
+      return {
+        background: objects.filter((object, index) => isStatic(object) && index < firstSlot),
+        foreground: objects.filter((object, index) => isStatic(object) && index > lastSlot),
+      };
+    }
+
+    function renderCanvasLayer(layer) {
+      const canvas = imgEditor.canvas;
+      const profile = activeProfile();
+      const layers = activeStaticLayers();
+      const visibleObjects = new Set(layers[layer]);
+      const objectVisibility = canvas.getObjects().map(object => object.visible);
+      const currentZoom = canvas.getZoom();
+      const backgroundImage = canvas.backgroundImage;
+      const backgroundColor = canvas.backgroundColor;
+
+      canvas.getObjects().forEach(object => {
+        object.visible = visibleObjects.has(object);
+      });
+      if (layer === 'foreground') {
+        canvas.backgroundImage = null;
+        canvas.backgroundColor = 'rgba(0,0,0,0)';
+      }
+      imgEditor.applyZoom(1);
+
+      try {
+        canvas.requestRenderAll();
+        return dataURLToBytes(canvas.toDataURL({
+          format: 'png',
+          multiplier: 1,
+          left: 0,
+          top: 0,
+          width: profile.width,
+          height: profile.height,
+        }));
+      } finally {
+        canvas.getObjects().forEach((object, index) => {
+          object.visible = objectVisibility[index];
+        });
+        canvas.backgroundImage = backgroundImage;
+        canvas.backgroundColor = backgroundColor;
+        imgEditor.applyZoom(currentZoom);
+        canvas.requestRenderAll();
+      }
+    }
+
+    function canvasPNGBytes(canvas) {
+      return new Promise((resolve, reject) => {
+        canvas.toBlob(async blob => {
+          if (!blob) {
+            reject(new Error('Could not render PNG'));
+            return;
+          }
+          resolve(new Uint8Array(await blob.arrayBuffer()));
+        }, 'image/png');
+      });
+    }
+
+    async function stripSheetBytes(sourceBytes) {
+      const bitmap = await createImageBitmap(new Blob([sourceBytes], { type: 'image/png' }));
+      const pair = document.createElement('canvas');
+      pair.width = PRINT_HEIGHT;
+      pair.height = PRINT_WIDTH;
+      const pairContext = pair.getContext('2d');
+      pairContext.drawImage(bitmap, 0, 0);
+      pairContext.save();
+      pairContext.translate(PRINT_HEIGHT, 0);
+      pairContext.scale(-1, 1);
+      pairContext.drawImage(bitmap, 0, 0);
+      pairContext.restore();
+      bitmap.close?.();
+
+      const sheet = document.createElement('canvas');
+      sheet.width = PRINT_WIDTH;
+      sheet.height = PRINT_HEIGHT;
+      const sheetContext = sheet.getContext('2d');
+      sheetContext.translate(0, PRINT_HEIGHT);
+      sheetContext.rotate(-Math.PI / 2);
+      sheetContext.drawImage(pair, 0, 0);
+      return canvasPNGBytes(sheet);
+    }
+
+    function activeTextBlocks(usedFonts) {
+      const profile = activeProfile();
+      return imgEditor.canvas.getObjects()
+        .filter(object => isTextObject(object) && !object.excludeFromExport)
+        .map(object => exportTextBlock(object, usedFonts, profile.width, profile.height));
+    }
+
+    function gridTemplate(usedFonts, hasForeground) {
       const photoLayout = imgEditor.getPhotoLayoutState();
       const photos = photoLayout?.photos || [];
-      const usedFonts = new Map();
 
       if (!photos.length) {
         throw new Error(translate('Добавьте хотя бы одно фото', 'Add at least one photo slot'));
       }
 
-      const textBlocks = imgEditor.canvas.getObjects()
-        .filter(object => isTextObject(object) && !object.excludeFromExport)
-        .map(object => exportTextBlock(object, usedFonts));
+      const textBlocks = activeTextBlocks(usedFonts);
       const firstPhoto = photos[0];
-      const trim = imgEditor.getPrintTrimState?.() || PRINT_TRIM;
-      const printTrim = {
-        left: Math.round(Number(trim.left) || 0),
-        top: Math.round(Number(trim.top) || 0),
-        right: Math.round(Number(trim.right) || 0),
-        bottom: Math.round(Number(trim.bottom) || 0),
-      };
-      printTrim.visible_size = [
-        PRINT_WIDTH - printTrim.left - printTrim.right,
-        PRINT_HEIGHT - printTrim.top - printTrim.bottom,
-      ];
-
       const layout = {
         background: 'grid_bg.png',
         photos: photos.map(photo => ({
@@ -1620,6 +2381,7 @@
           rotate: 'none',
         })),
       };
+      if (hasForeground) layout.foreground = 'grid_bg_after.png';
 
       if (textBlocks.length) {
         layout.texts = textBlocks;
@@ -1627,65 +2389,238 @@
       }
 
       return {
-        key,
-        usedFonts,
-        config: {
-          print_size: [PRINT_WIDTH, PRINT_HEIGHT],
-          print_trim: printTrim,
-          templates: {
-            [key]: {
-              label,
-              photo_size_px: {
-                width: Math.round(firstPhoto.width),
-                height: Math.round(firstPhoto.height),
-              },
-              print_layout: layout,
-              preview_rotation: 'none',
-              preview_split: 'none',
-            },
-          },
+        label: layoutLabels.grid,
+        photo_size_px: {
+          width: Math.round(firstPhoto.width),
+          height: Math.round(firstPhoto.height),
         },
+        print_layout: layout,
+        preview_rotation: 'none',
+        preview_split: 'none',
       };
     }
 
-    function renderGridBackground() {
-      const canvas = imgEditor.canvas;
-      const currentZoom = canvas.getZoom();
-      const hiddenObjects = canvas.getObjects().filter(object => (
-        object.excludeFromExport
-        || object.kind === 'photo-slot'
-        || isTextObject(object)
-      ));
-      const visibility = hiddenObjects.map(object => object.visible);
+    function swappedAlign(align) {
+      if (align === 'left') return 'right';
+      if (align === 'right') return 'left';
+      return 'center';
+    }
 
-      hiddenObjects.forEach(object => object.set('visible', false));
-      imgEditor.applyZoom(1);
+    function stripTextCopies(block) {
+      const left = {
+        ...block,
+        position: {
+          x: block.position.y,
+          y: PRINT_HEIGHT - block.position.x,
+        },
+        angle: normalizedAngle(block.angle - 90),
+      };
+      const right = {
+        ...block,
+        position: {
+          x: block.position.y,
+          y: block.position.x,
+        },
+        align: swappedAlign(block.align),
+        angle: normalizedAngle(-block.angle - 90),
+        skew: {
+          x: round(-block.skew.x),
+          y: round(-block.skew.y),
+        },
+      };
+      return [right, left];
+    }
 
-      try {
-        canvas.requestRenderAll();
-        return dataURLToBytes(canvas.toDataURL({
-          format: 'png',
-          multiplier: 1,
-          width: PRINT_WIDTH,
-          height: PRINT_HEIGHT,
-        }));
-      } finally {
-        hiddenObjects.forEach((object, index) => object.set('visible', visibility[index]));
-        imgEditor.applyZoom(currentZoom);
-        canvas.requestRenderAll();
+    function stripsTemplate(usedFonts, hasForeground) {
+      const photos = imgEditor.getPhotoLayoutState()?.photos || [];
+      if (!photos.length) {
+        throw new Error(translate('Добавьте фото на левую полосу', 'Add photos to the left strip'));
       }
+
+      const textCopies = activeTextBlocks(usedFonts).map(stripTextCopies);
+      const textBlocks = [
+        ...textCopies.map(([right]) => right),
+        ...textCopies.map(([, left]) => left),
+      ];
+      const rightPhotos = photos.map(photo => ({
+        photo_index: photo.photo_index,
+        x: Math.round(photo.y),
+        y: Math.round(photo.x),
+        width: Math.round(photo.height),
+        height: Math.round(photo.width),
+        rotate: 'ccw',
+      }));
+      const leftPhotos = photos.map(photo => ({
+        photo_index: photo.photo_index,
+        x: Math.round(photo.y),
+        y: Math.round(PRINT_HEIGHT - photo.x - photo.width),
+        width: Math.round(photo.height),
+        height: Math.round(photo.width),
+        rotate: 'ccw',
+      }));
+      const layout = {
+        background: 'strip_bg.png',
+        photos: [...rightPhotos, ...leftPhotos],
+      };
+      if (hasForeground) layout.foreground = 'strip_bg_after.png';
+      if (textBlocks.length) {
+        layout.texts = textBlocks;
+        layout._texts_date_tokens = ['{dd}.{mm}.{yyyy}', '{dd} {month_ru} {yyyy}'];
+      }
+
+      return {
+        label: layoutLabels.strips,
+        photo_size_px: {
+          width: Math.round(photos[0].height),
+          height: Math.round(photos[0].width),
+        },
+        print_layout: layout,
+        preview_rotation: 'cw',
+        preview_split: 'horizontal',
+      };
+    }
+
+    function layoutHasBackground(layout) {
+      const canvas = layoutDocuments[layout]?.canvas;
+      return Boolean(canvas && (canvas.backgroundImage || canvas.background));
+    }
+
+    function layoutReadiness(layout) {
+      const documentState = layoutDocuments[layout];
+      if (!documentState?.canvas) {
+        return translate('не создан', 'not created');
+      }
+      if (!layoutHasBackground(layout)) {
+        return translate('нет фона', 'no background');
+      }
+      const objects = documentState.canvas.objects || [];
+      if (!objects.some(object => object.kind === 'photo-slot')) {
+        return translate('нет фотослотов', 'no photo slots');
+      }
+      const missingFont = objects.find(object => (
+        object.type === 'i-text'
+        && object.fontFile
+        && !fontAssets.has(object.fontFile)
+      ));
+      if (missingFont) {
+        return translate(`нет шрифта ${missingFont.fontFile}`, `missing font ${missingFont.fontFile}`);
+      }
+      return null;
     }
 
     function renderExportSummary() {
       if (!exportControls.summary || !imgEditor.canvas) return;
+      if (!isSwitchingLayout) captureActiveLayout();
 
-      const texts = imgEditor.canvas.getObjects().filter(isTextObject);
-      const missingFonts = texts.filter(object => !fontAssetForObject(object));
-      exportControls.summary.classList.toggle('warning', missingFonts.length > 0);
-      exportControls.summary.textContent = translate(
-        `Подписей: ${texts.length} · файлов шрифтов: ${fontAssets.size}${missingFonts.length ? ` · без файла: ${missingFonts.length}` : ''}`,
-        `Text objects: ${texts.length} · font files: ${fontAssets.size}${missingFonts.length ? ` · missing files: ${missingFonts.length}` : ''}`,
+      const states = Object.keys(LAYOUT_PROFILES).map(layout => ({
+        layout,
+        error: layoutReadiness(layout),
+      }));
+      const errors = states.filter(state => state.error);
+      states.forEach(state => {
+        const indicator = document.querySelector(`[data-layout-status="${state.layout}"]`);
+        indicator?.classList.toggle('ready', !state.error);
+        indicator?.classList.toggle('missing', Boolean(state.error));
+        indicator?.setAttribute('title', state.error || translate('Готово', 'Ready'));
+      });
+      exportControls.summary.classList.toggle('warning', errors.length > 0);
+      exportControls.summary.textContent = states.map(state => {
+        const label = state.layout === 'grid'
+          ? translate('Грид', 'Grid')
+          : translate('Стрипсы', 'Strips');
+        return `${label}: ${state.error || translate('готов', 'ready')}`;
+      }).join(' · ');
+      exportControls.config.disabled = (
+        errors.length > 0 || exportControls.config.classList.contains('busy')
       );
+      exportControls.gridBackground.disabled = (
+        !layoutHasBackground('grid')
+        || exportControls.gridBackground.classList.contains('busy')
+      );
+      exportControls.stripBackground.disabled = (
+        !layoutHasBackground('strips')
+        || exportControls.stripBackground.classList.contains('busy')
+      );
+      exportControls.package.disabled = (
+        errors.length > 0 || exportControls.package.classList.contains('busy')
+      );
+    }
+
+    async function exportProject(includeImages) {
+      const { name } = exportSettings();
+      const originalLayout = activeLayout;
+      const usedFonts = new Map();
+      const templates = {};
+      const images = [];
+
+      captureActiveLayout();
+      try {
+        for (const layout of ['grid', 'strips']) {
+          if (activeLayout !== layout) {
+            await loadLayout(layout);
+          }
+          await ensureOnlineFontAssets();
+          const hasForeground = activeStaticLayers().foreground.length > 0;
+          templates[layout] = layout === 'grid'
+            ? gridTemplate(usedFonts, hasForeground)
+            : stripsTemplate(usedFonts, hasForeground);
+
+          if (includeImages) {
+            let background = renderCanvasLayer('background');
+            let foreground = hasForeground ? renderCanvasLayer('foreground') : null;
+            if (layout === 'strips') {
+              background = await stripSheetBytes(background);
+              if (foreground) foreground = await stripSheetBytes(foreground);
+            }
+            images.push({
+              name: layout === 'grid' ? 'grid_bg.png' : 'strip_bg.png',
+              data: background,
+            });
+            if (foreground) {
+              images.push({
+                name: layout === 'grid' ? 'grid_bg_after.png' : 'strip_bg_after.png',
+                data: foreground,
+              });
+            }
+          }
+          captureActiveLayout();
+        }
+      } finally {
+        if (activeLayout !== originalLayout) {
+          await loadLayout(originalLayout);
+        }
+        captureActiveLayout();
+        queueDraftSave();
+      }
+
+      return {
+        name,
+        usedFonts,
+        images,
+        config: {
+          print_size: [PRINT_WIDTH, PRINT_HEIGHT],
+          print_trim: printTrimConfig(),
+          templates,
+        },
+      };
+    }
+
+    async function downloadLayoutBackground(layout) {
+      const originalLayout = activeLayout;
+
+      captureActiveLayout();
+      try {
+        if (activeLayout !== layout) await loadLayout(layout);
+        let bytes = renderCanvasLayer('background');
+        if (layout === 'strips') bytes = await stripSheetBytes(bytes);
+        downloadBlob(
+          new Blob([bytes], { type: 'image/png' }),
+          layout === 'grid' ? 'grid_bg.png' : 'strip_bg.png',
+        );
+      } finally {
+        if (activeLayout !== originalLayout) await loadLayout(originalLayout);
+        captureActiveLayout();
+      }
     }
 
     function fontAssetForObject(object) {
@@ -1711,8 +2646,6 @@
         imgEditor.refreshTextDimensions(object, object.fontFamily);
       }));
 
-      queueDraftSave();
-      renderExportSummary();
     }
 
     function packagedFontFiles(usedFonts, encoder) {
@@ -1741,7 +2674,7 @@
       return files;
     }
 
-    async function installUploadedFontFile(file) {
+    async function installUploadedFontFile(file, replace = false) {
       if (!FONT_FILE_PATTERN.test(file?.name || '') || !file?.size) {
         throw templateImportError(
           'Выберите непустой файл TTF или OTF',
@@ -1750,7 +2683,7 @@
       }
 
       const duplicate = fontAssets.get(file.name);
-      if (duplicate) return duplicate;
+      if (duplicate && !replace) return duplicate;
 
       const id = globalThis.crypto?.randomUUID?.()
         || `${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -1764,33 +2697,112 @@
       });
     }
 
-    function updateImportBackgroundHint() {
-      const key = importControls.key.value;
-      const expected = importConfig?.templates?.[key]?.print_layout?.background;
-      importControls.backgroundHint.textContent = expected
-        ? translate(`В конфиге: ${expected}`, `Configured file: ${expected}`)
-        : '';
+    function packageConfigEntry(files) {
+      const matches = [...files.keys()].filter(path => path === 'config.json' || path.endsWith('/config.json'));
+      if (matches.length !== 1) {
+        throw templateImportError(
+          'В пакете должен быть ровно один config.json',
+          'The package must contain exactly one config.json',
+        );
+      }
+      const path = matches[0];
+      return {
+        path,
+        root: path.includes('/') ? path.slice(0, path.lastIndexOf('/') + 1) : '',
+        value: files.get(path),
+      };
     }
 
-    async function applyImportedTemplate(definition, backgroundImage, backgroundFile, fonts) {
-      const canvas = imgEditor.canvas;
-      const previousRestoring = isRestoringDraft;
-      const previousHistoryProcessing = canvas.historyProcessing;
-      let completed = false;
+    function packageAsset(files, root, name) {
+      if (typeof name !== 'string' || !name || name.includes('\\')) {
+        throw templateImportError('Некорректное имя файла в config.json', 'Invalid asset name in config.json');
+      }
+      const path = normalizedArchivePath(`${root}${name}`);
+      const value = files.get(path);
+      if (!value) {
+        throw templateImportError(`Не найден файл ${name}`, `File ${name} was not found`);
+      }
+      return value;
+    }
 
-      isRestoringDraft = true;
+    async function bitmapFromPackageAsset(value, name) {
+      const bytes = await packageFileBytes(value);
+      const bitmap = await createImageBitmap(new Blob([bytes], { type: mimeTypeForName(name) }));
+      return { bytes, bitmap };
+    }
+
+    async function leftStripBytes(value, name) {
+      const { bitmap } = await bitmapFromPackageAsset(value, name);
+      try {
+        if (bitmap.width !== PRINT_WIDTH || bitmap.height !== PRINT_HEIGHT) {
+          throw templateImportError(
+            `${name} должен быть ${PRINT_WIDTH} × ${PRINT_HEIGHT} px`,
+            `${name} must be ${PRINT_WIDTH} × ${PRINT_HEIGHT} px`,
+          );
+        }
+        const strip = document.createElement('canvas');
+        strip.width = STRIP_WIDTH;
+        strip.height = STRIP_HEIGHT;
+        const context = strip.getContext('2d');
+        context.translate(PRINT_HEIGHT, 0);
+        context.rotate(Math.PI / 2);
+        context.drawImage(bitmap, 0, 0);
+        return canvasPNGBytes(strip);
+      } finally {
+        bitmap.close?.();
+      }
+    }
+
+    async function gridAssetBytes(value, name) {
+      const { bytes, bitmap } = await bitmapFromPackageAsset(value, name);
+      try {
+        if (bitmap.width !== PRINT_WIDTH || bitmap.height !== PRINT_HEIGHT) {
+          throw templateImportError(
+            `${name} должен быть ${PRINT_WIDTH} × ${PRINT_HEIGHT} px`,
+            `${name} must be ${PRINT_WIDTH} × ${PRINT_HEIGHT} px`,
+          );
+        }
+        return bytes;
+      } finally {
+        bitmap.close?.();
+      }
+    }
+
+    async function imageFromPNGBytes(bytes) {
+      const source = await readFileAsDataURL(new Blob([bytes], { type: 'image/png' }));
+      return loadFabricImage(source);
+    }
+
+    async function prepareImportedImages(files, root, definition) {
+      const backgroundAsset = packageAsset(files, root, definition.background);
+      const foregroundAsset = definition.foreground
+        ? packageAsset(files, root, definition.foreground)
+        : null;
+      const convert = definition.key === 'strips' ? leftStripBytes : gridAssetBytes;
+      return {
+        background: await convert(backgroundAsset, definition.background),
+        foreground: foregroundAsset
+          ? await convert(foregroundAsset, definition.foreground)
+          : null,
+      };
+    }
+
+    async function applyImportedLayout(definition, images, fonts) {
+      const canvas = imgEditor.canvas;
+      const previousHistoryProcessing = canvas.historyProcessing;
       canvas.historyProcessing = true;
       try {
-        canvas.discardActiveObject();
-        canvas.getObjects().forEach(object => canvas.remove(object));
+        layoutDocuments[definition.key] = null;
+        await loadLayout(definition.key);
+        canvas.historyProcessing = true;
+        clearCanvasDocument();
+        imgEditor.setBackgroundFillState(defaultBackgroundFillState());
+        const backgroundImage = await imageFromPNGBytes(images.background);
         await installBackgroundImage(backgroundImage, {
-          fileName: backgroundFile.name,
-          fileSize: backgroundFile.size,
+          fileName: definition.background,
+          fileSize: images.background.length,
         }, 'cover');
 
-        if (!imgEditor.setPrintTrimState(definition.trim)) {
-          throw templateImportError('Не удалось применить обрезку', 'Could not apply print trim');
-        }
         if (!imgEditor.setPhotoLayoutState({
           photos: definition.photos,
           symmetry: { enabled: false },
@@ -1801,51 +2813,76 @@
           );
         }
 
+        if (images.foreground) {
+          const foreground = await imageFromPNGBytes(images.foreground);
+          foreground.set({
+            left: 0,
+            top: 0,
+            originX: 'left',
+            originY: 'top',
+            selectable: true,
+            evented: true,
+            assetFileName: definition.foreground,
+            kind: 'template-foreground',
+          });
+          canvas.add(foreground);
+        }
+
         definition.texts.forEach(block => {
           const text = importedTextObject(block, fonts.get(block.font));
           canvas.add(text);
           text.setCoords();
         });
 
-        exportControls.key.value = definition.key;
-        exportControls.label.value = definition.label;
+        layoutLabels[definition.key] = definition.label;
+
         imgEditor.activeSelection = null;
         canvas.requestRenderAll();
         imgEditor.fitZoom();
-        renderExportSummary();
-        completed = true;
       } finally {
         canvas.historyProcessing = previousHistoryProcessing;
-        isRestoringDraft = previousRestoring;
       }
 
-      if (completed && !previousHistoryProcessing) {
-        canvas.clearHistory();
-        canvas._historySaveAction();
-      }
-      await flushDraftSave();
+      canvas.clearHistory();
+      canvas._historySaveAction();
+      captureActiveLayout();
     }
 
     async function runTemplateImport() {
-      if (
-        !importConfig
-        || !importControls.key.value
-        || !importControls.background.files?.[0]
-      ) {
-        updateImportButton();
-        return;
-      }
+      if (!importFiles || importBusy) return;
 
-      importControls.run.classList.add('busy');
-      importControls.run.disabled = true;
+      importBusy = true;
+      importControls.package.disabled = true;
+      importControls.folder.disabled = true;
+      setLayoutTabsDisabled(true);
       setImportStatus(translate('Проверяю шаблон…', 'Checking template…'));
 
+      const previousRestoring = isRestoringDraft;
       try {
-        const definition = importedTemplateDefinition(
-          importConfig,
-          importControls.key.value,
+        const configEntry = packageConfigEntry(importFiles);
+        const configText = configEntry.value instanceof File
+          ? await configEntry.value.text()
+          : new TextDecoder().decode(configEntry.value);
+        const config = JSON.parse(configText);
+        const trim = validatedImportedConfig(config);
+        const definitions = [
+          importedGridDefinition(config),
+          importedStripsDefinition(config),
+        ];
+
+        const referencedFonts = new Set(
+          definitions.flatMap(definition => definition.texts.map(block => block.font)),
         );
-        const resolvedFonts = await resolveImportedFonts(definition.texts);
+        for (const fileName of referencedFonts) {
+          const value = importFiles.get(normalizedArchivePath(`${configEntry.root}${fileName}`));
+          if (value) {
+            await installUploadedFontFile(await packageFile(value, fileName), true);
+          }
+        }
+
+        const resolvedFonts = await resolveImportedFonts(
+          definitions.flatMap(definition => definition.texts),
+        );
 
         if (resolvedFonts.missing.length) {
           missingImportFonts = resolvedFonts.missing;
@@ -1858,38 +2895,28 @@
         }
 
         clearMissingImportFonts();
-        const backgroundFile = importControls.background.files[0];
-        const validBackground = backgroundFile.size > 0 && (
-          BACKGROUND_TYPES.has((backgroundFile.type || '').toLowerCase())
-          || /\.(?:jpe?g|png|webp)$/i.test(backgroundFile.name)
-        );
-        if (!validBackground) {
-          throw templateImportError(
-            'Выберите непустой фон JPG, PNG или WEBP',
-            'Choose a non-empty JPG, PNG or WEBP background',
-          );
-        }
-
-        const source = await readFileAsDataURL(backgroundFile);
-        const backgroundImage = await loadFabricImage(source);
-        if (
-          backgroundImage.width !== PRINT_WIDTH
-          || backgroundImage.height !== PRINT_HEIGHT
-        ) {
-          throw templateImportError(
-            `Фон должен быть ${PRINT_WIDTH} × ${PRINT_HEIGHT} px`,
-            `Background must be ${PRINT_WIDTH} × ${PRINT_HEIGHT} px`,
-          );
-        }
-
-        await applyImportedTemplate(
+        const prepared = await Promise.all(definitions.map(async definition => ({
           definition,
-          backgroundImage,
-          backgroundFile,
-          resolvedFonts.assets,
-        );
+          images: await prepareImportedImages(importFiles, configEntry.root, definition),
+        })));
+
+        isRestoringDraft = true;
+        projectTrim = {
+          left: trim.left,
+          top: trim.top,
+          right: trim.right,
+          bottom: trim.bottom,
+        };
+        for (const item of prepared) {
+          await applyImportedLayout(item.definition, item.images, resolvedFonts.assets);
+        }
+        projectName = configEntry.root
+          ? configEntry.root.replace(/\/$/, '').split('/').pop()
+          : (importControls.package.files?.[0]?.name.replace(/\.zip$/i, '') || 'template');
+        exportControls.name.value = projectName;
+        if (activeLayout !== 'grid') await loadLayout('grid');
         setImportStatus(
-          translate(`Шаблон «${definition.label}» импортирован`, `“${definition.label}” imported`),
+          translate('Грид и стрипсы импортированы', 'Grid and strips were imported'),
           'success',
         );
         imgEditor.toast(
@@ -1900,83 +2927,57 @@
         console.error('[template-studio] import error', error);
         setImportStatus(error.message, 'error');
       } finally {
-        importControls.run.classList.remove('busy');
-        updateImportButton();
+        isRestoringDraft = previousRestoring;
+        importBusy = false;
+        importControls.package.disabled = false;
+        importControls.folder.disabled = false;
+        setLayoutTabsDisabled(false);
+        renderExportSummary();
       }
+      if (!previousRestoring) await flushDraftSave();
     }
 
-    importControls.config.addEventListener('change', async event => {
+    importControls.package.addEventListener('change', async event => {
       const file = event.target.files?.[0];
-      importConfig = null;
-      importControls.key.replaceChildren();
-      importControls.choice.hidden = true;
-      importControls.backgroundHint.textContent = '';
+      importFiles = null;
       clearMissingImportFonts();
-
       if (!file) {
         setImportStatus();
-        updateImportButton();
         return;
       }
 
       try {
-        const config = JSON.parse(await file.text());
-        const keys = config?.templates
-          && typeof config.templates === 'object'
-          && !Array.isArray(config.templates)
-          ? Object.keys(config.templates)
-          : [];
-        if (!keys.length) {
-          throw templateImportError(
-            'В config.json нет шаблонов',
-            'config.json contains no templates',
-          );
-        }
-        if (
-          !Array.isArray(config.print_size)
-          || config.print_size[0] !== PRINT_WIDTH
-          || config.print_size[1] !== PRINT_HEIGHT
-        ) {
-          throw templateImportError(
-            `Размер конфига должен быть ${PRINT_WIDTH} × ${PRINT_HEIGHT} px`,
-            `Config size must be ${PRINT_WIDTH} × ${PRINT_HEIGHT} px`,
-          );
-        }
-
-        keys.forEach(key => {
-          const option = document.createElement('option');
-          const label = config.templates[key]?.label;
-          option.value = key;
-          option.textContent = label ? `${key} — ${label}` : key;
-          importControls.key.appendChild(option);
-        });
-        importControls.key.value = keys.includes('grid') ? 'grid' : keys[0];
-        importControls.choice.hidden = keys.length < 2;
-        importConfig = config;
-        updateImportBackgroundHint();
-        setImportStatus(translate(
-          `Конфиг прочитан: ${keys.length} макет(а)`,
-          `Config loaded: ${keys.length} layout(s)`,
-        ));
+        setImportStatus(translate('Читаю ZIP…', 'Reading ZIP…'));
+        importFiles = await unzipFiles(file);
+        packageConfigEntry(importFiles);
+        importControls.folder.value = '';
+        await runTemplateImport();
       } catch (error) {
+        importFiles = null;
         setImportStatus(error.message || translate(
           'Не удалось прочитать config.json',
           'Could not read config.json',
         ), 'error');
       }
-      updateImportButton();
     });
 
-    importControls.key.addEventListener('change', () => {
+    importControls.folder.addEventListener('change', async event => {
+      importFiles = event.target.files?.length ? folderFiles(event.target.files) : null;
       clearMissingImportFonts();
-      updateImportBackgroundHint();
-      updateImportButton();
+      if (importFiles) {
+        importControls.package.value = '';
+        try {
+          setImportStatus(translate('Читаю папку…', 'Reading folder…'));
+          packageConfigEntry(importFiles);
+          await runTemplateImport();
+        } catch (error) {
+          importFiles = null;
+          setImportStatus(error.message, 'error');
+        }
+      } else {
+        setImportStatus();
+      }
     });
-    importControls.background.addEventListener('change', () => {
-      clearMissingImportFonts();
-      updateImportButton();
-    });
-    importControls.run.addEventListener('click', runTemplateImport);
     importControls.fonts.addEventListener('click', () => {
       importControls.fontInput.click();
     });
@@ -2030,39 +3031,66 @@
       }
     });
 
+    [
+      ['grid', exportControls.gridBackground],
+      ['strips', exportControls.stripBackground],
+    ].forEach(([layout, button]) => {
+      button.addEventListener('click', async () => {
+        button.classList.add('busy');
+        button.disabled = true;
+        setLayoutTabsDisabled(true);
+
+        try {
+          await downloadLayoutBackground(layout);
+        } catch (error) {
+          console.error(`[template-studio] ${layout} background export error`, error);
+          imgEditor.toast(error.message, 'Danger', 4000);
+        } finally {
+          button.classList.remove('busy');
+          setLayoutTabsDisabled(false);
+          renderExportSummary();
+        }
+      });
+    });
+
     exportControls.config.addEventListener('click', async () => {
+      exportControls.config.classList.add('busy');
       exportControls.config.disabled = true;
+      setLayoutTabsDisabled(true);
 
       try {
-        await ensureOnlineFontAssets();
-        const { config } = buildTemplateConfig();
+        const { config } = await exportProject(false);
         downloadBlob(new Blob([
           `${JSON.stringify(config, null, 2)}\n`,
         ], { type: 'application/json;charset=utf-8' }), 'config.json');
       } catch (error) {
+        console.error('[template-studio] config export error', error);
         imgEditor.toast(error.message, 'Danger', 4000);
       } finally {
-        exportControls.config.disabled = false;
+        exportControls.config.classList.remove('busy');
+        setLayoutTabsDisabled(false);
+        renderExportSummary();
       }
     });
 
     exportControls.package.addEventListener('click', async () => {
+      exportControls.package.classList.add('busy');
       exportControls.package.disabled = true;
+      setLayoutTabsDisabled(true);
 
       try {
-        await ensureOnlineFontAssets();
-        const { key, config, usedFonts } = buildTemplateConfig();
+        const { name, config, usedFonts, images } = await exportProject(true);
         const encoder = new TextEncoder();
         const files = [
           {
             name: 'config.json',
             data: encoder.encode(`${JSON.stringify(config, null, 2)}\n`),
           },
-          { name: 'grid_bg.png', data: renderGridBackground() },
+          ...images,
           ...packagedFontFiles(usedFonts, encoder),
         ];
 
-        downloadBlob(zipFiles(files), `${key}.zip`);
+        downloadBlob(zipFiles(files), `${name}.zip`);
         imgEditor.toast(
           translate('ZIP шаблона готов', 'Template ZIP is ready'),
           'Success',
@@ -2071,17 +3099,41 @@
         console.error('[template-studio] export error', error);
         imgEditor.toast(error.message, 'Danger', 4500);
       } finally {
-        exportControls.package.disabled = false;
+        exportControls.package.classList.remove('busy');
+        setLayoutTabsDisabled(false);
+        renderExportSummary();
       }
     });
 
-    [exportControls.key, exportControls.label].forEach(input => {
-      input.addEventListener('change', queueDraftSave);
+    exportControls.name.addEventListener('input', () => {
+      projectName = exportControls.name.value.trim() || 'template';
+      queueDraftSave();
+    });
+
+    layoutTabs.forEach(tab => {
+      tab.addEventListener('click', async () => {
+        if (tab.dataset.layoutTab === activeLayout || isSwitchingLayout) return;
+
+        setLayoutTabsDisabled(true);
+        try {
+          await switchLayout(tab.dataset.layoutTab);
+        } catch (error) {
+          console.error('[template-studio] could not switch layout', error);
+          imgEditor.toast(
+            translate('Не удалось переключить макет', 'Could not switch layout'),
+            'Danger',
+            3500,
+          );
+        } finally {
+          setLayoutTabsDisabled(false);
+        }
+      });
     });
 
     renderExportSummary();
 
     function canvasObjectsWithPositioning() {
+      const { width, height } = activeProfile();
       const canvasData = imgEditor.canvas.toJSON([
         'uniqueId',
         'kind',
@@ -2096,8 +3148,8 @@
         .map(object => {
           const leftOffset = object.left;
           const topOffset = object.top;
-          const rightOffset = PRINT_WIDTH - leftOffset;
-          const bottomOffset = PRINT_HEIGHT - topOffset;
+          const rightOffset = width - leftOffset;
+          const bottomOffset = height - topOffset;
           const nearestXSide = leftOffset <= rightOffset ? 'left' : 'right';
           const nearestYSide = topOffset <= bottomOffset ? 'top' : 'bottom';
 
@@ -2114,8 +3166,9 @@
     }
 
     function templateThumbnail() {
+      const { width, height } = activeProfile();
       const currentZoom = imgEditor.canvas.getZoom();
-      const multiplier = Math.min(200 / PRINT_WIDTH, 200 / PRINT_HEIGHT);
+      const multiplier = Math.min(200 / width, 200 / height);
       const photoSlots = imgEditor.canvas.getObjects()
         .filter(object => object.kind === 'photo-slot');
       const visibility = photoSlots.map(slot => slot.visible);
@@ -2126,8 +3179,8 @@
         return imgEditor.canvas.toDataURL({
           format: 'png',
           multiplier,
-          width: PRINT_WIDTH,
-          height: PRINT_HEIGHT,
+          width,
+          height,
         });
       } finally {
         photoSlots.forEach((slot, index) => {
@@ -2258,6 +3311,11 @@
     ];
     draftEvents.forEach(eventName => {
       imgEditor.canvas.on(eventName, () => {
+        if (eventName === 'trim:modified') {
+          syncStripPairTrim();
+        } else {
+          renderStripCopy();
+        }
         queueDraftSave();
         renderExportSummary();
       });
@@ -2266,16 +3324,19 @@
     window.templateStudio = {
       editor: imgEditor,
       printSize: [PRINT_WIDTH, PRINT_HEIGHT],
+      stripSize: [STRIP_WIDTH, STRIP_HEIGHT],
       background: backgroundState,
       templateApi,
       setBackgroundFile,
       setBackgroundSource,
       setBackgroundFit,
       removeBackground,
+      switchLayout,
       saveDraft: saveCurrentDraft,
     };
 
     await installBundledFonts();
+    setCanvasProfile('grid');
 
     let restoredDraft = false;
 
@@ -2292,7 +3353,23 @@
         3500,
       );
     } finally {
+      if (!restoredDraft) {
+        captureActiveLayout();
+      }
+
+      const initialLayout = activeLayout;
+      for (const layout of Object.keys(layoutDocuments)) {
+        if (!layoutDocuments[layout]) {
+          await loadLayout(layout);
+        }
+      }
+      if (activeLayout !== initialLayout) {
+        await loadLayout(initialLayout);
+      }
+
+      exportControls.name.value = projectName;
       isRestoringDraft = false;
+      renderExportSummary();
     }
 
     document.addEventListener('visibilitychange', () => {
@@ -2312,6 +3389,8 @@
     document.querySelector('.appLoader')?.remove();
     console.info('[template-studio] ready', {
       printSize: [PRINT_WIDTH, PRINT_HEIGHT],
+      stripSize: [STRIP_WIDTH, STRIP_HEIGHT],
+      activeLayout,
       restoredDraft,
     });
   }
