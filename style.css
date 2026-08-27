@@ -2339,14 +2339,16 @@ select:focus-visible,
 
 .template-gallery-section,
 .template-import-section,
-.template-export-section {
+.template-export-section,
+.template-yadisk-section {
     display: grid;
     gap: 9px;
 }
 
 .template-gallery-section h4,
 .template-import-section h4,
-.template-export-section h4 {
+.template-export-section h4,
+.template-yadisk-section h4 {
     margin: 0;
 }
 

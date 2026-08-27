@@ -1826,7 +1826,27 @@
       gridBackground: document.querySelector('#download-template-grid-background'),
       stripBackground: document.querySelector('#download-template-strip-background'),
       package: document.querySelector('#download-template-package'),
+      yadiskToken: document.querySelector('#yadisk-template-token'),
+      yadiskName: document.querySelector('#yadisk-template-name'),
+      yadiskButton: document.querySelector('#export-template-yadisk'),
+      yadiskStatus: document.querySelector('#yadisk-template-status'),
     };
+    const YADISK_TOKEN_SESSION_KEY = 'template-studio-yadisk-token';
+    try {
+      exportControls.yadiskToken.value = sessionStorage.getItem(YADISK_TOKEN_SESSION_KEY) || '';
+    } catch (_error) {
+      // Storage may be unavailable for a restricted file:// or private context.
+    }
+    exportControls.yadiskToken.addEventListener('input', () => {
+      try {
+        const token = exportControls.yadiskToken.value;
+        if (token) sessionStorage.setItem(YADISK_TOKEN_SESSION_KEY, token);
+        else sessionStorage.removeItem(YADISK_TOKEN_SESSION_KEY);
+      } catch (_error) {
+        // Export still works with the value currently held by the input.
+      }
+    });
+
     const importControls = {
       package: document.querySelector('#import-template-package'),
       folder: document.querySelector('#import-template-folder'),
@@ -2679,8 +2699,8 @@
       );
     }
 
-    async function exportProject(includeImages) {
-      const { name } = exportSettings();
+    async function exportProject(includeImages, explicitName = null) {
+      const name = explicitName ?? exportSettings().name;
       const originalLayout = activeLayout;
       const usedFonts = new Map();
       const templates = {};
@@ -2805,6 +2825,122 @@
       });
 
       return files;
+    }
+
+    function exportedProjectFiles(config, usedFonts, images) {
+      const encoder = new TextEncoder();
+      return [
+        {
+          name: 'config.json',
+          data: encoder.encode(`${JSON.stringify(config, null, 2)}\n`),
+        },
+        ...images,
+        ...packagedFontFiles(usedFonts, encoder),
+      ];
+    }
+
+    function setYadiskStatus(message = '', type = '') {
+      exportControls.yadiskStatus.hidden = !message;
+      exportControls.yadiskStatus.textContent = message;
+      exportControls.yadiskStatus.className = `template-import-status ${type}`.trim();
+    }
+
+    async function yadiskApi(token, method, endpoint, params = {}, accepted = []) {
+      const query = new URLSearchParams(params);
+      const response = await fetch(
+        `https://cloud-api.yandex.net/v1/disk${endpoint}?${query}`,
+        {
+          method,
+          headers: {
+            Authorization: `OAuth ${token}`,
+          },
+        },
+      );
+      if (!response.ok && !accepted.includes(response.status)) {
+        let detail = '';
+        try {
+          const payload = await response.json();
+          detail = payload.description || payload.message || '';
+        } catch (_error) {
+          detail = await response.text().catch(() => '');
+        }
+        throw new Error(
+          translate(
+            `Яндекс Диск: HTTP ${response.status}${detail ? ` — ${detail}` : ''}`,
+            `Yandex Disk: HTTP ${response.status}${detail ? ` — ${detail}` : ''}`,
+          ),
+        );
+      }
+      if (response.status === 204 || accepted.includes(response.status)) return {};
+      const text = await response.text();
+      return text ? JSON.parse(text) : {};
+    }
+
+    async function ensureYadiskDirectory(path, token) {
+      const existing = await yadiskApi(
+        token,
+        'GET',
+        '/resources',
+        { path, fields: 'type' },
+        [404],
+      );
+      if (existing.type === 'dir') return;
+      if (existing.type) {
+        throw new Error(translate(
+          `Путь ${path} уже занят файлом`,
+          `Path ${path} is occupied by a file`,
+        ));
+      }
+      // 409 is still accepted in case another client creates the directory
+      // between this existence check and the PUT request.
+      await yadiskApi(token, 'PUT', '/resources', { path }, [409]);
+    }
+
+    async function uploadYadiskFile(path, data, token) {
+      const metadata = await yadiskApi(token, 'GET', '/resources/upload', {
+        path,
+        overwrite: 'true',
+      });
+      if (typeof metadata.href !== 'string') {
+        throw new Error(translate(
+          'Яндекс Диск не вернул ссылку загрузки',
+          'Yandex Disk did not return an upload URL',
+        ));
+      }
+      const response = await fetch(metadata.href, {
+        method: 'PUT',
+        body: new Blob([data]),
+      });
+      if (!response.ok) {
+        throw new Error(`Yandex Disk upload: HTTP ${response.status}`);
+      }
+    }
+
+    async function uploadProjectToYadisk(project, token, packName) {
+      const root = '/photobooth_system/templates_custom';
+      const target = `${root}/${packName}`;
+      await ensureYadiskDirectory('/photobooth_system', token);
+      await ensureYadiskDirectory(root, token);
+      await ensureYadiskDirectory(target, token);
+
+      const files = exportedProjectFiles(
+        project.config,
+        project.usedFonts,
+        project.images,
+      );
+      const ordered = [
+        ...files.filter(file => file.name !== 'config.json'),
+        ...files.filter(file => file.name === 'config.json'),
+      ];
+      for (let index = 0; index < ordered.length; index += 1) {
+        const file = ordered[index];
+        setYadiskStatus(translate(
+          `Загружаю ${index + 1}/${ordered.length}: ${file.name}`,
+          `Uploading ${index + 1}/${ordered.length}: ${file.name}`,
+        ));
+        await uploadYadiskFile(`${target}/${file.name}`, file.data, token);
+      }
+      return files.length;
     }
 
     async function installUploadedFontFile(file, replace = false) {
@@ -3225,15 +3361,7 @@
 
       try {
         const { name, config, usedFonts, images } = await exportProject(true);
-        const encoder = new TextEncoder();
-        const files = [
-          {
-            name: 'config.json',
-            data: encoder.encode(`${JSON.stringify(config, null, 2)}\n`),
-          },
-          ...images,
-          ...packagedFontFiles(usedFonts, encoder),
-        ];
+        const files = exportedProjectFiles(config, usedFonts, images);
 
         downloadBlob(zipFiles(files), `${name}.zip`);
         imgEditor.toast(
@@ -3245,6 +3373,55 @@
         imgEditor.toast(error.message, 'Danger', 4500);
       } finally {
         exportControls.package.classList.remove('busy');
+        setLayoutTabsDisabled(false);
+        renderExportSummary();
+      }
+    });
+
+    exportControls.yadiskButton.addEventListener('click', async () => {
+      const token = exportControls.yadiskToken.value.trim();
+      const packName = exportControls.yadiskName.value.trim();
+      if (!token) {
+        setYadiskStatus(translate(
+          'Введите OAuth-токен Яндекс Диска',
+          'Enter a Yandex Disk OAuth token',
+        ), 'error');
+        return;
+      }
+      if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(packName)) {
+        setYadiskStatus(translate(
+          'Имя: строчные латинские буквы, цифры, _ и -, максимум 64 символа',
+          'Use lowercase letters, numbers, _ and -, up to 64 characters',
+        ), 'error');
+        return;
+      }
+
+      exportControls.yadiskButton.classList.add('busy');
+      exportControls.yadiskButton.disabled = true;
+      setLayoutTabsDisabled(true);
+      setYadiskStatus(translate('Готовлю шаблон…', 'Preparing template…'));
+      try {
+        const project = await exportProject(true, packName);
+        const count = await uploadProjectToYadisk(project, token, packName);
+        setYadiskStatus(translate(
+          `Загружено файлов: ${count}`,
+          `Uploaded files: ${count}`,
+        ), 'success');
+        imgEditor.toast(
+          translate('Шаблон экспортирован на Яндекс Диск', 'Template exported to Yandex Disk'),
+          'Success',
+        );
+      } catch (error) {
+        console.error('[template-studio] Yandex Disk export error', error);
+        setYadiskStatus(error.message, 'error');
+        imgEditor.toast(
+          translate('Не удалось экспортировать шаблон', 'Could not export template'),
+          'Danger',
+          4500,
+        );
+      } finally {
+        exportControls.yadiskButton.classList.remove('busy');
+        exportControls.yadiskButton.disabled = false;
         setLayoutTabsDisabled(false);
         renderExportSummary();
       }
