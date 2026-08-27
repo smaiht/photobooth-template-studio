@@ -11,6 +11,12 @@
     right: 55,
     bottom: 55,
   };
+  const DEFAULT_TRIM_PREVIEW = {
+    visible: true,
+    mode: 'zones',
+    color: '#ff2d55',
+    opacity: 75,
+  };
   const PHOTO_LAYOUT = {
     defaultPreset: 'grid-2x2',
     maxPhotos: 12,
@@ -410,17 +416,13 @@
   async function start() {
     const buttons = [
       'select',
-      'shapes',
-      'draw',
-      'line',
-      'path',
       'text',
       'photo-layout',
       'trim',
       'background',
       'upload-image',
-      'templates',
       'export-template',
+      'create-tools',
       'download-image',
       'animation',
       'undo',
@@ -450,6 +452,9 @@
     };
     const layoutLabels = { ...DEFAULT_LAYOUT_LABELS };
     let activeLayout = 'grid';
+    let pendingBackgroundLayout = null;
+    let activeBackgroundFillState = null;
+    let mirrorSecondStrip = true;
     let projectTrim = { ...PRINT_TRIM };
     let projectName = 'template';
     let isSwitchingLayout = false;
@@ -457,6 +462,7 @@
     let draftSaveTimer = null;
     let draftSaveQueue = Promise.resolve();
     let draftSaveErrorShown = false;
+    let importBusy = false;
 
     backgroundInput.id = 'background-file-input';
     backgroundInput.type = 'file';
@@ -556,31 +562,46 @@
         stripCopyCanvas.setDimensions({ width, height });
       }
       stripCopyCanvas.cancelRequestedRender();
-      stripCopyCanvas.viewportTransform = [
-        -zoom,
-        0,
-        0,
-        zoom,
-        width,
-        0,
-      ];
+      stripCopyCanvas.viewportTransform = [zoom, 0, 0, zoom, 0, 0];
       stripCopyCanvas.backgroundColor = sourceCanvas.backgroundColor;
       stripCopyCanvas.backgroundImage = sourceCanvas.backgroundImage;
       const sourceObjects = sourceCanvas.getObjects();
-      const readableObjects = sourceObjects.filter(object => (
-        object.kind === 'photo-slot' || isTextObject(object)
-      ));
-
-      // The full strip is mirrored. Flip photo and text objects once more so
-      // their contents stay readable while their positions remain mirrored.
-      readableObjects.forEach(object => {
-        object.flipX = !object.flipX;
-      });
+      const objectStates = sourceObjects.map(object => ({
+        object,
+        left: object.left,
+        originX: object.originX,
+        angle: object.angle,
+        skewX: object.skewX,
+        textAlign: object.textAlign,
+      }));
+      const backgroundImage = sourceCanvas.backgroundImage;
+      const backgroundFlipX = backgroundImage?.flipX;
       try {
+        if (mirrorSecondStrip && backgroundImage) {
+          backgroundImage.set('flipX', !backgroundFlipX);
+        }
+        objectStates.forEach(({ object, left, originX, angle, skewX, textAlign }) => {
+          object.set({
+            left: sourceCanvas.originalW - (Number(left) || 0),
+            originX: originX === 'left' ? 'right' : (originX === 'right' ? 'left' : originX),
+            angle: -(Number(angle) || 0),
+            skewX: -(Number(skewX) || 0),
+            ...(isTextObject(object) ? { textAlign: swappedAlign(textAlign) } : {}),
+          });
+        });
         stripCopyCanvas.renderCanvas(stripCopyCanvas.contextContainer, sourceObjects);
       } finally {
-        readableObjects.forEach(object => {
-          object.flipX = !object.flipX;
+        if (mirrorSecondStrip && backgroundImage) {
+          backgroundImage.set('flipX', backgroundFlipX);
+        }
+        objectStates.forEach(({ object, left, originX, angle, skewX, textAlign }) => {
+          object.set({
+            left,
+            originX,
+            angle,
+            skewX,
+            ...(isTextObject(object) ? { textAlign } : {}),
+          });
         });
       }
       stripCopyCanvas.cancelRequestedRender();
@@ -962,13 +983,21 @@
     imgEditor.setActiveTool('select');
 
     const backgroundControls = {
-      upload: document.querySelector('#background-upload-button'),
-      fileCard: document.querySelector('#background-file-card'),
-      fileName: document.querySelector('#background-file-name'),
-      fileDetails: document.querySelector('#background-file-details'),
-      remove: document.querySelector('#background-remove-button'),
-      fitSettings: document.querySelector('#background-fit-settings'),
-      fitButtons: document.querySelectorAll('[data-background-fit]'),
+      layouts: Object.fromEntries(['grid', 'strips'].map(layout => {
+        const section = document.querySelector(
+          `[data-background-layout-section="${layout}"]`,
+        );
+        return [layout, {
+          upload: section.querySelector('[data-background-upload-layout]'),
+          fileCard: section.querySelector('[data-background-file-card]'),
+          fileName: section.querySelector('[data-background-file-name]'),
+          fileDetails: section.querySelector('[data-background-file-details]'),
+          remove: section.querySelector('[data-background-remove-layout]'),
+          fitSettings: section.querySelector('[data-background-fit-settings]'),
+          fitButtons: [...section.querySelectorAll('[data-background-fit]')],
+        }];
+      })),
+      mirrorSecondStrip: document.querySelector('#strip-mirror-second'),
     };
 
     function formatFileSize(bytes) {
@@ -983,30 +1012,66 @@
       return `${(bytes / (1024 * 1024)).toFixed(1)} ${translate('МБ', 'MB')}`;
     }
 
+    function cloneBackgroundFillState(state) {
+      const source = state || defaultBackgroundFillState();
+      return {
+        type: source.type === 'gradient' ? 'gradient' : 'color',
+        color: /^#[0-9a-f]{6}$/i.test(source.color || '') ? source.color : '#ffffff',
+        gradient: {
+          type: source.gradient?.type === 'radial' ? 'radial' : 'linear',
+          angle: Number(source.gradient?.angle) || 0,
+          stops: Array.isArray(source.gradient?.stops) && source.gradient.stops.length
+            ? source.gradient.stops.map(stop => ({
+              color: stop.color,
+              position: Number(stop.position) || 0,
+            }))
+            : defaultBackgroundFillState().gradient.stops,
+        },
+      };
+    }
+
+    function backgroundImageForLayout(layout) {
+      return layout === activeLayout
+        ? imgEditor.canvas.backgroundImage
+        : layoutDocuments[layout]?.canvas?.backgroundImage;
+    }
+
+    function backgroundMetadataForLayout(layout) {
+      return layout === activeLayout
+        ? backgroundState
+        : (layoutDocuments[layout]?.background || emptyBackgroundState());
+    }
+
     function renderBackgroundControls() {
-      const hasBackground = Boolean(imgEditor.canvas.backgroundImage);
+      Object.entries(backgroundControls.layouts).forEach(([layout, controls]) => {
+        const image = backgroundImageForLayout(layout);
+        const metadata = backgroundMetadataForLayout(layout);
+        const hasBackground = Boolean(image);
 
-      backgroundControls.upload.textContent = hasBackground
-        ? translate('Заменить фоновое изображение', 'Replace background image')
-        : translate('Выбрать фоновое изображение', 'Choose background image');
-      backgroundControls.fileCard.hidden = !hasBackground;
-      backgroundControls.fitSettings.hidden = !hasBackground;
+        controls.upload.classList.toggle('has-background', hasBackground);
+        controls.upload.textContent = hasBackground
+          ? translate('Заменить фон', 'Replace background')
+          : translate('Загрузить фон', 'Upload background');
+        controls.fileCard.hidden = !hasBackground;
+        controls.fitSettings.hidden = !hasBackground;
 
-      if (!hasBackground) {
-        return;
-      }
+        if (!hasBackground) return;
 
-      backgroundControls.fileName.textContent = backgroundState.fileName;
-      backgroundControls.fileDetails.textContent = [
-        `${backgroundState.sourceWidth} × ${backgroundState.sourceHeight} px`,
-        formatFileSize(backgroundState.fileSize),
-      ].filter(Boolean).join(' · ');
-
-      backgroundControls.fitButtons.forEach(button => {
-        const isActive = button.dataset.backgroundFit === backgroundState.fitMode;
-        button.classList.toggle('active', isActive);
-        button.setAttribute('aria-pressed', String(isActive));
+        controls.fileName.textContent = metadata.fileName
+          || translate('Фоновое изображение', 'Background image');
+        controls.fileDetails.textContent = [
+          metadata.sourceWidth && metadata.sourceHeight
+            ? `${metadata.sourceWidth} × ${metadata.sourceHeight} px`
+            : '',
+          formatFileSize(metadata.fileSize),
+        ].filter(Boolean).join(' · ');
+        controls.fitButtons.forEach(button => {
+          const isActive = button.dataset.backgroundFit === (metadata.fitMode || 'cover');
+          button.classList.toggle('active', isActive);
+          button.setAttribute('aria-pressed', String(isActive));
+        });
       });
+      backgroundControls.mirrorSecondStrip.checked = mirrorSecondStrip;
     }
 
     function handleDraftSaveError(error) {
@@ -1085,6 +1150,42 @@
       };
     }
 
+    function ensureLayoutDocument(layout) {
+      if (!layoutDocuments[layout]) {
+        layoutDocuments[layout] = {
+          canvas: {
+            version: fabric.version,
+            objects: [],
+          },
+          backgroundFill: defaultBackgroundFillState(),
+          trimPreview: { ...DEFAULT_TRIM_PREVIEW },
+          photoLayoutView: {
+            visible: true,
+            axesVisible: true,
+            editing: false,
+          },
+          background: emptyBackgroundState(),
+          historyUndo: [],
+          historyRedo: [],
+        };
+      }
+      return layoutDocuments[layout];
+    }
+
+    imgEditor.onBackgroundFillChange = (layout, state) => {
+      const nextState = cloneBackgroundFillState(state);
+
+      if (layout === activeLayout) {
+        activeBackgroundFillState = nextState;
+        return false;
+      }
+
+      ensureLayoutDocument(layout).backgroundFill = nextState;
+      queueDraftSave();
+      renderExportSummary();
+      return true;
+    };
+
     function setCanvasProfile(layout) {
       const profile = LAYOUT_PROFILES[layout];
       const canvas = imgEditor.canvas;
@@ -1147,7 +1248,7 @@
 
       layoutDocuments[activeLayout] = {
         canvas: canvasDraftJSON(),
-        backgroundFill: imgEditor.getBackgroundFillState(),
+        backgroundFill: cloneBackgroundFillState(activeBackgroundFillState),
         trimPreview: imgEditor.getTrimPreviewState(),
         photoLayoutView: imgEditor.getPhotoLayoutViewState(),
         background: { ...backgroundState },
@@ -1171,35 +1272,8 @@
     function clearCanvasDocument() {
       const canvas = imgEditor.canvas;
       canvas.discardActiveObject();
-      canvas.getObjects().forEach(object => canvas.remove(object));
-      canvas.backgroundImage = null;
-      canvas.overlayImage = null;
+      canvas.clear();
       canvas.setBackgroundColor('#ffffff');
-    }
-
-    function emptyLayoutDocument() {
-      return {
-        canvas: {
-          version: fabric.version,
-          objects: [],
-          background: '#ffffff',
-        },
-        backgroundFill: defaultBackgroundFillState(),
-        trimPreview: {
-          visible: false,
-          mode: 'zones',
-          color: '#ff2d55',
-          opacity: 75,
-        },
-        photoLayoutView: {
-          visible: true,
-          axesVisible: false,
-          editing: false,
-        },
-        background: emptyBackgroundState(),
-        historyUndo: [],
-        historyRedo: [],
-      };
     }
 
     async function loadLayout(layout) {
@@ -1217,20 +1291,28 @@
         if (documentState?.canvas) {
           await restoreOnlineFonts(documentState.canvas);
           await loadCanvasJSON(documentState.canvas);
-          imgEditor.syncPhotoLayout(false);
-          imgEditor.setBackgroundFillState(documentState.backgroundFill);
-          imgEditor.setPhotoLayoutViewState(documentState.photoLayoutView);
-          imgEditor.setTrimPreviewState(documentState.trimPreview);
+          imgEditor.syncPhotoLayout(true);
+          activeBackgroundFillState = cloneBackgroundFillState(documentState.backgroundFill);
+          imgEditor.setBackgroundFillState(layout, activeBackgroundFillState);
+          imgEditor.setPhotoLayoutViewState({
+            ...documentState.photoLayoutView,
+            editing: false,
+          });
+          imgEditor.setTrimPreviewState({
+            ...DEFAULT_TRIM_PREVIEW,
+            ...documentState.trimPreview,
+          });
           Object.assign(backgroundState, emptyBackgroundState(), documentState.background);
         } else {
-          imgEditor.setBackgroundFillState(defaultBackgroundFillState());
+          activeBackgroundFillState = defaultBackgroundFillState();
+          imgEditor.setBackgroundFillState(layout, activeBackgroundFillState);
           imgEditor.resetPhotoLayout(false);
           imgEditor.setPhotoLayoutViewState({
             visible: true,
             axesVisible: true,
             editing: false,
           });
-          imgEditor.setTrimPreviewState({ visible: false, mode: 'zones' });
+          imgEditor.setTrimPreviewState(DEFAULT_TRIM_PREVIEW);
           Object.assign(backgroundState, emptyBackgroundState());
         }
 
@@ -1258,22 +1340,49 @@
 
     imgEditor.clearProject = async () => {
       if (isSwitchingLayout) return;
+      if (importBusy) {
+        imgEditor.toast(
+          translate('Дождитесь завершения импорта', 'Wait for the import to finish'),
+          'Warning',
+          3000,
+        );
+        return;
+      }
+      if (!window.confirm(translate(
+        'Очистить весь проект? Фоны, тексты и другие объекты будут удалены. Отменить очистку нельзя.',
+        'Clear the entire project? Backgrounds, texts and other objects will be removed. This cannot be undone.',
+      ))) {
+        return;
+      }
 
       const previousRestoringDraft = isRestoringDraft;
+      const initialLayout = activeLayout;
       let cleared = false;
       clearTimeout(draftSaveTimer);
       setLayoutTabsDisabled(true);
       isRestoringDraft = true;
 
       try {
+        imgEditor.canvas.projectRevision = (imgEditor.canvas.projectRevision || 0) + 1;
         projectTrim = { ...PRINT_TRIM };
         projectName = 'template';
+        mirrorSecondStrip = true;
+        pendingBackgroundLayout = null;
         Object.assign(layoutLabels, DEFAULT_LAYOUT_LABELS);
         Object.keys(layoutDocuments).forEach(layout => {
-          layoutDocuments[layout] = emptyLayoutDocument();
+          layoutDocuments[layout] = null;
+          imgEditor.setBackgroundFillState(layout, defaultBackgroundFillState(), false);
         });
 
         backgroundInput.value = '';
+        fontInput.value = '';
+        [...fontAssets].forEach(([fileName, asset]) => {
+          if (asset.source !== 'bundled') {
+            fontAssets.delete(fileName);
+          }
+        });
+        onlineFontAssetLoads.clear();
+        renderLocalFontOptions();
         importFiles = null;
         importControls.package.value = '';
         importControls.folder.value = '';
@@ -1281,7 +1390,40 @@
         clearMissingImportFonts();
         setImportStatus();
         exportControls.name.value = projectName;
-        await loadLayout(activeLayout);
+        await loadLayout(initialLayout);
+        imgEditor.canvas.historyProcessing = false;
+
+        const unexpectedObjects = imgEditor.canvas.getObjects().filter(
+          object => object.kind !== 'photo-slot',
+        );
+        if (unexpectedObjects.length) {
+          imgEditor.canvas.remove(...unexpectedObjects);
+        }
+        imgEditor.canvas.backgroundImage = null;
+        imgEditor.canvas.overlayImage = null;
+        Object.assign(backgroundState, emptyBackgroundState());
+        imgEditor.canvas.requestRenderAll();
+        renderBackgroundControls();
+        renderStripCopy();
+        imgEditor.canvas.clearHistory();
+        imgEditor.canvas._historySaveAction();
+        captureActiveLayout();
+
+        const remainingObjects = imgEditor.canvas.getObjects().filter(
+          object => object.kind !== 'photo-slot',
+        );
+        if (remainingObjects.length || imgEditor.canvas.backgroundImage) {
+          throw new Error('Canvas still contains project artwork after clear');
+        }
+        console.info('[template-studio] project canvas cleared', {
+          layout: activeLayout,
+          revision: imgEditor.canvas.projectRevision,
+          objects: imgEditor.canvas.getObjects().map(object => ({
+            type: object.type,
+            kind: object.kind || null,
+          })),
+          backgroundImage: Boolean(imgEditor.canvas.backgroundImage),
+        });
         imgEditor.setActiveTool('select');
         renderExportSummary();
         cleared = true;
@@ -1331,6 +1473,7 @@
         savedAt: Date.now(),
         activeLayout,
         projectName,
+        mirrorSecondStrip,
         printTrim: projectTrim,
         layoutLabels: { ...layoutLabels },
         layouts: {
@@ -1404,6 +1547,7 @@
       }
 
       await restoreFontAssets(draft.fonts);
+      mirrorSecondStrip = draft.mirrorSecondStrip !== false;
       projectTrim = { ...PRINT_TRIM, ...draft.printTrim };
       projectName = typeof draft.projectName === 'string' && draft.projectName
         ? draft.projectName
@@ -1419,6 +1563,13 @@
         layoutDocuments[layout] = saved
           ? { ...saved, historyUndo: [], historyRedo: [] }
           : null;
+        if (saved) {
+          imgEditor.setBackgroundFillState(
+            layout,
+            cloneBackgroundFillState(saved.backgroundFill),
+            false,
+          );
+        }
       }
       activeLayout = LAYOUT_PROFILES[draft.activeLayout] ? draft.activeLayout : 'grid';
       await loadLayout(activeLayout);
@@ -1426,10 +1577,10 @@
       return true;
     }
 
-    function applyBackgroundFit(image, fitMode) {
-      const { width, height } = activeProfile();
-      const widthScale = width / image.width;
-      const heightScale = height / image.height;
+    function backgroundFitGeometry(sourceWidth, sourceHeight, fitMode, layout) {
+      const { width, height } = LAYOUT_PROFILES[layout];
+      const widthScale = width / sourceWidth;
+      const heightScale = height / sourceHeight;
       const scaleX = fitMode === 'stretch'
         ? widthScale
         : Math.max(widthScale, heightScale);
@@ -1437,7 +1588,7 @@
         ? heightScale
         : Math.max(widthScale, heightScale);
 
-      image.set({
+      return {
         originX: 'center',
         originY: 'center',
         left: width / 2,
@@ -1448,10 +1599,15 @@
         selectable: false,
         evented: false,
         backgroundFitMode: fitMode,
-      });
+      };
+    }
+
+    function applyBackgroundFit(image, fitMode, layout = activeLayout) {
+      const geometry = backgroundFitGeometry(image.width, image.height, fitMode, layout);
+      image.set(geometry);
       image.setCoords();
 
-      return { scaleX, scaleY };
+      return { scaleX: geometry.scaleX, scaleY: geometry.scaleY };
     }
 
     async function installBackgroundImage(image, metadata, fitMode) {
@@ -1491,117 +1647,72 @@
       });
     }
 
-    function chooseBackgroundFit(file, image) {
-      const { width, height } = activeProfile();
-      const previousFocus = document.activeElement;
-      const dialog = document.createElement('div');
-      dialog.className = 'background-fit-dialog';
-      dialog.innerHTML = `
-        <div class="background-fit-dialog-card" role="dialog" aria-modal="true" aria-labelledby="background-fit-title">
-          <div class="background-fit-dialog-header">
-            <span class="background-fit-dialog-mark" aria-hidden="true">!</span>
-            <div>
-              <h2 id="background-fit-title">
-                ${translate('Размер фона не совпадает', 'Background size does not match')}
-              </h2>
-              <p class="background-fit-source"></p>
-            </div>
-          </div>
-          <p class="background-fit-question">
-            ${translate('Как разместить изображение в макете?', 'How should the image fit the canvas?')}
-          </p>
-          <div class="background-fit-choices">
-            <button class="background-fit-choice recommended" type="button" data-fit-choice="cover">
-              <span class="background-fit-choice-preview preview-cover" aria-hidden="true"><i></i></span>
-              <span class="background-fit-choice-copy">
-                <strong>${translate('Заполнить с обрезкой', 'Fill and crop')}</strong>
-                <span>${translate(
-                  'Без искажений. Лишнее по краям будет обрезано.',
-                  'Keeps proportions and crops anything outside the edges.',
-                )}</span>
-              </span>
-              <em>${translate('Рекомендуется', 'Recommended')}</em>
-            </button>
-            <button class="background-fit-choice" type="button" data-fit-choice="stretch">
-              <span class="background-fit-choice-preview preview-stretch" aria-hidden="true"><i></i></span>
-              <span class="background-fit-choice-copy">
-                <strong>${translate('Растянуть по размеру', 'Stretch to fit')}</strong>
-                <span>${translate(
-                  'Вся картинка поместится, но её пропорции изменятся.',
-                  'Shows the whole image, but changes its proportions.',
-                )}</span>
-              </span>
-            </button>
-          </div>
-          <button class="background-fit-cancel" type="button" data-fit-cancel>
-            ${translate('Отмена', 'Cancel')}
-          </button>
-        </div>
-      `;
-      dialog.querySelector('.background-fit-source').textContent = translate(
-        `${file.name}: ${image.width} × ${image.height} px, макет: ${width} × ${height} px`,
-        `${file.name}: ${image.width} × ${image.height} px, canvas: ${width} × ${height} px`,
-      );
-      document.body.appendChild(dialog);
+    async function installBackgroundForLayout(image, metadata, fitMode, layout) {
+      if (layout === activeLayout) {
+        await installBackgroundImage(image, metadata, fitMode);
+        return;
+      }
 
-      return new Promise(resolve => {
-        let settled = false;
+      const scales = applyBackgroundFit(image, fitMode, layout);
+      image.set({
+        assetFileName: metadata.fileName,
+        assetFileSize: metadata.fileSize || null,
+      });
+      const documentState = ensureLayoutDocument(layout);
+      documentState.canvas.backgroundImage = image.toObject([
+        'assetFileName',
+        'assetFileSize',
+        'backgroundFitMode',
+      ]);
+      documentState.background = {
+        fileName: metadata.fileName,
+        fileSize: metadata.fileSize || null,
+        sourceWidth: image.width,
+        sourceHeight: image.height,
+        fitMode,
+      };
+      renderBackgroundControls();
+      renderExportSummary();
+      if (!isRestoringDraft) await flushDraftSave();
 
-        const finish = fitMode => {
-          if (settled) {
-            return;
-          }
-
-          settled = true;
-          document.removeEventListener('keydown', handleKeydown);
-          dialog.remove();
-          previousFocus?.focus();
-          resolve(fitMode);
-        };
-
-        const handleKeydown = event => {
-          if (event.key === 'Escape') {
-            finish(null);
-          }
-        };
-
-        dialog.addEventListener('click', event => {
-          const choice = event.target.closest('[data-fit-choice]');
-
-          if (choice) {
-            finish(choice.dataset.fitChoice);
-            return;
-          }
-
-          if (event.target === dialog || event.target.closest('[data-fit-cancel]')) {
-            finish(null);
-          }
-        });
-        document.addEventListener('keydown', handleKeydown);
-        dialog.querySelector('[data-fit-choice="cover"]').focus();
+      console.info('[template-studio] background loaded', {
+        layout,
+        sourceSize: [image.width, image.height],
+        canvasSize: [LAYOUT_PROFILES[layout].width, LAYOUT_PROFILES[layout].height],
+        fitMode,
+        scale: [scales.scaleX, scales.scaleY],
       });
     }
 
-    async function setBackgroundSource(source, asset = {}, fitMode = 'cover') {
+    async function setBackgroundSource(
+      source,
+      asset = {},
+      fitMode = 'cover',
+      layout = activeLayout,
+    ) {
       if (fitMode !== 'cover' && fitMode !== 'stretch') {
         throw new Error(`Unknown background fit mode: ${fitMode}`);
       }
+      if (!LAYOUT_PROFILES[layout]) throw new Error(`Unknown layout: ${layout}`);
 
+      const revision = imgEditor.canvas.projectRevision || 0;
       const image = await loadFabricImage(source);
+      if ((imgEditor.canvas.projectRevision || 0) !== revision) return false;
       const fileName = asset.name
         || (asset.path ? asset.path.split('/').pop() : null)
         || translate('Фоновое изображение', 'Background image');
 
-      await installBackgroundImage(image, {
+      await installBackgroundForLayout(image, {
         fileName,
         fileSize: asset.size || null,
-      }, fitMode);
+      }, fitMode, layout);
 
       return true;
     }
 
-    async function setBackgroundFile(file) {
-      const { width, height } = activeProfile();
+    async function setBackgroundFile(file, layout = activeLayout) {
+      if (!LAYOUT_PROFILES[layout]) throw new Error(`Unknown layout: ${layout}`);
+      const revision = imgEditor.canvas.projectRevision || 0;
       const mimeType = (file.type || '').toLowerCase();
       const hasKnownExtension = /\.(?:jpe?g|png|webp)$/i.test(file.name);
       const isSupported = BACKGROUND_TYPES.has(mimeType) || hasKnownExtension;
@@ -1628,70 +1739,83 @@
           'Could not decode the image',
         ));
       }
+      if ((imgEditor.canvas.projectRevision || 0) !== revision) return false;
 
-      let fitMode = 'cover';
-      const dimensionsMatch = image.width === width
-        && image.height === height;
-
-      if (!dimensionsMatch) {
-        fitMode = await chooseBackgroundFit(file, image);
-      }
-
-      if (!fitMode) {
-        return false;
-      }
-
-      await installBackgroundImage(image, {
+      await installBackgroundForLayout(image, {
         fileName: file.name,
         fileSize: file.size,
-      }, fitMode);
+      }, 'cover', layout);
 
       return true;
     }
 
-    function setBackgroundFit(fitMode) {
-      const image = imgEditor.canvas.backgroundImage;
-
-      if (!image || (fitMode !== 'cover' && fitMode !== 'stretch')) {
+    function setBackgroundFit(fitMode, layout = activeLayout) {
+      const image = backgroundImageForLayout(layout);
+      if (!image || !LAYOUT_PROFILES[layout] || !['cover', 'stretch'].includes(fitMode)) {
         return;
       }
 
-      applyBackgroundFit(image, fitMode);
-      backgroundState.fitMode = fitMode;
-      imgEditor.canvas.requestRenderAll();
+      if (layout === activeLayout) {
+        applyBackgroundFit(image, fitMode, layout);
+        backgroundState.fitMode = fitMode;
+        imgEditor.canvas.requestRenderAll();
+        renderBackgroundControls();
+        imgEditor.canvas.fire('background:modified');
+        return;
+      }
+
+      Object.assign(
+        image,
+        backgroundFitGeometry(image.width, image.height, fitMode, layout),
+      );
+      ensureLayoutDocument(layout).background.fitMode = fitMode;
       renderBackgroundControls();
-      imgEditor.canvas.fire('background:modified');
+      renderExportSummary();
+      queueDraftSave();
     }
 
-    function removeBackground() {
-      imgEditor.canvas.setBackgroundImage(null, () => {
-        imgEditor.canvas.requestRenderAll();
-      });
-
-      Object.assign(backgroundState, {
-        fileName: null,
-        fileSize: null,
-        sourceWidth: null,
-        sourceHeight: null,
-        fitMode: 'cover',
-      });
+    function removeBackground(layout = activeLayout) {
+      if (layout === activeLayout) {
+        imgEditor.canvas.setBackgroundImage(null, () => {
+          imgEditor.canvas.requestRenderAll();
+        });
+        Object.assign(backgroundState, emptyBackgroundState());
+        imgEditor.canvas.fire('background:modified');
+      } else {
+        const documentState = ensureLayoutDocument(layout);
+        delete documentState.canvas.backgroundImage;
+        documentState.background = emptyBackgroundState();
+        renderExportSummary();
+        queueDraftSave();
+      }
 
       renderBackgroundControls();
-      imgEditor.canvas.fire('background:modified');
       imgEditor.toast(
-        translate('Фоновое изображение удалено', 'Background image removed'),
+        translate(
+          `Фон ${layout === 'grid' ? 'Grid' : 'Strips'} удалён`,
+          `${layout === 'grid' ? 'Grid' : 'Strips'} background removed`,
+        ),
         'Success',
       );
     }
 
-    backgroundControls.upload.addEventListener('click', () => {
-      backgroundInput.click();
-    });
-    backgroundControls.remove.addEventListener('click', removeBackground);
-    backgroundControls.fitButtons.forEach(button => {
-      button.addEventListener('click', () => {
-        setBackgroundFit(button.dataset.backgroundFit);
+    Object.entries(backgroundControls.layouts).forEach(([layout, controls]) => {
+      controls.upload.addEventListener('click', () => {
+        pendingBackgroundLayout = layout;
+        backgroundInput.click();
       });
+      controls.remove.addEventListener('click', () => removeBackground(layout));
+      controls.fitButtons.forEach(button => {
+        button.addEventListener('click', () => {
+          setBackgroundFit(button.dataset.backgroundFit, layout);
+        });
+      });
+    });
+    backgroundControls.mirrorSecondStrip.addEventListener('change', event => {
+      mirrorSecondStrip = event.target.checked;
+      renderStripCopy();
+      renderExportSummary();
+      queueDraftSave();
     });
     renderBackgroundControls();
 
@@ -1711,7 +1835,6 @@
       status: document.querySelector('#import-template-status'),
     };
     let importFiles = null;
-    let importBusy = false;
     let missingImportFonts = [];
 
     function isTextObject(object) {
@@ -2075,6 +2198,7 @@
         texts,
         background: layout.background,
         foreground: layout.foreground || null,
+        mirrorSecondStrip: template.mirror_second_strip !== false,
       };
     }
 
@@ -2336,11 +2460,15 @@
       pair.height = PRINT_WIDTH;
       const pairContext = pair.getContext('2d');
       pairContext.drawImage(bitmap, 0, 0);
-      pairContext.save();
-      pairContext.translate(PRINT_HEIGHT, 0);
-      pairContext.scale(-1, 1);
-      pairContext.drawImage(bitmap, 0, 0);
-      pairContext.restore();
+      if (mirrorSecondStrip) {
+        pairContext.save();
+        pairContext.translate(PRINT_HEIGHT, 0);
+        pairContext.scale(-1, 1);
+        pairContext.drawImage(bitmap, 0, 0);
+        pairContext.restore();
+      } else {
+        pairContext.drawImage(bitmap, STRIP_WIDTH, 0);
+      }
       bitmap.close?.();
 
       const sheet = document.createElement('canvas');
@@ -2477,12 +2605,17 @@
         print_layout: layout,
         preview_rotation: 'cw',
         preview_split: 'horizontal',
+        mirror_second_strip: mirrorSecondStrip,
       };
     }
 
     function layoutHasBackground(layout) {
-      const canvas = layoutDocuments[layout]?.canvas;
-      return Boolean(canvas && (canvas.backgroundImage || canvas.background));
+      const documentState = layoutDocuments[layout];
+      const canvas = documentState?.canvas;
+      const fill = documentState?.backgroundFill;
+      const hasFill = fill?.type === 'gradient'
+        || /^#[0-9a-f]{6}$/i.test(fill?.color || '');
+      return Boolean(canvas && (canvas.backgroundImage || canvas.background || hasFill));
     }
 
     function layoutReadiness(layout) {
@@ -2796,7 +2929,8 @@
         await loadLayout(definition.key);
         canvas.historyProcessing = true;
         clearCanvasDocument();
-        imgEditor.setBackgroundFillState(defaultBackgroundFillState());
+        activeBackgroundFillState = defaultBackgroundFillState();
+        imgEditor.setBackgroundFillState(definition.key, activeBackgroundFillState);
         const backgroundImage = await imageFromPNGBytes(images.background);
         await installBackgroundImage(backgroundImage, {
           fileName: definition.background,
@@ -2901,6 +3035,9 @@
         })));
 
         isRestoringDraft = true;
+        mirrorSecondStrip = definitions.find(
+          definition => definition.key === 'strips',
+        )?.mirrorSecondStrip !== false;
         projectTrim = {
           left: trim.left,
           top: trim.top,
@@ -2939,6 +3076,7 @@
 
     importControls.package.addEventListener('change', async event => {
       const file = event.target.files?.[0];
+      const revision = imgEditor.canvas.projectRevision || 0;
       importFiles = null;
       clearMissingImportFonts();
       if (!file) {
@@ -2949,6 +3087,11 @@
       try {
         setImportStatus(translate('Читаю ZIP…', 'Reading ZIP…'));
         importFiles = await unzipFiles(file);
+        if ((imgEditor.canvas.projectRevision || 0) !== revision) {
+          importFiles = null;
+          setImportStatus();
+          return;
+        }
         packageConfigEntry(importFiles);
         importControls.folder.value = '';
         await runTemplateImport();
@@ -2983,6 +3126,7 @@
     });
     importControls.fontInput.addEventListener('change', async event => {
       const files = [...(event.target.files || [])];
+      const revision = imgEditor.canvas.projectRevision || 0;
       event.target.value = '';
       if (!files.length) return;
 
@@ -2990,6 +3134,7 @@
       try {
         for (const file of files) {
           await installUploadedFontFile(file);
+          if ((imgEditor.canvas.projectRevision || 0) !== revision) return;
         }
         await runTemplateImport();
       } catch (error) {
@@ -3196,7 +3341,7 @@
 
     function renderTemplates() {
       const list = document.querySelector(
-        `${imgEditor.containerSelector} #templates-panel .list-templates`,
+        `${imgEditor.containerSelector} #export-template-panel .list-templates`,
       );
       list.replaceChildren();
 
@@ -3205,7 +3350,7 @@
         const image = document.createElement('img');
         const deleteButton = document.createElement('button');
 
-        preview.className = 'template-preview';
+        preview.className = `template-preview${deleteMode ? ' delete-mode' : ''}`;
         preview.dataset.id = template.id;
         image.src = template.data.thumb;
         image.alt = 'Template preview';
@@ -3224,19 +3369,24 @@
 
     backgroundInput.addEventListener('change', async event => {
       const file = event.target.files?.[0];
+      const layout = pendingBackgroundLayout || activeLayout;
+      pendingBackgroundLayout = null;
       event.target.value = '';
       if (!file) {
         return;
       }
 
       try {
-        const wasLoaded = await setBackgroundFile(file);
+        const wasLoaded = await setBackgroundFile(file, layout);
         if (!wasLoaded) {
           return;
         }
 
         imgEditor.toast(
-          window.lang === 'ru' ? 'Фон загружен' : 'Background loaded',
+          translate(
+            `Фон ${layout === 'grid' ? 'Grid' : 'Strips'} загружен`,
+            `${layout === 'grid' ? 'Grid' : 'Strips'} background loaded`,
+          ),
           'Success',
         );
       } catch (error) {
