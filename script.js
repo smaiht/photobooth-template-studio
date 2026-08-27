@@ -2548,6 +2548,29 @@
       };
     }
 
+    function singleTemplate(grid) {
+      const photo = PHOTO_LAYOUT.presets.find(preset => preset.id === 'single').slots[0];
+      return {
+        label: '1 фото',
+        photo_choice: true,
+        photo_size_px: {
+          width: photo.width,
+          height: photo.height,
+        },
+        print_layout: {
+          ...grid.print_layout,
+          photos: [{
+            photo_index: 0,
+            x: photo.x,
+            y: photo.y,
+            rotate: 'none',
+          }],
+        },
+        preview_rotation: 'none',
+        preview_split: 'none',
+      };
+    }
+
     function swappedAlign(align) {
       if (align === 'left') return 'right';
       if (align === 'right') return 'left';
@@ -2717,6 +2740,7 @@
           templates[layout] = layout === 'grid'
             ? gridTemplate(usedFonts, hasForeground)
             : stripsTemplate(usedFonts, hasForeground);
+          if (layout === 'grid') templates.single = singleTemplate(templates.grid);
 
           if (includeImages) {
             let background = renderCanvasLayer('background');
