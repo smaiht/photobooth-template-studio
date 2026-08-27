@@ -2731,7 +2731,7 @@
 
       captureActiveLayout();
       try {
-        for (const layout of ['grid', 'strips']) {
+        for (const layout of ['strips', 'grid']) {
           if (activeLayout !== layout) {
             await loadLayout(layout);
           }
