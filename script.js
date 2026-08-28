@@ -127,39 +127,6 @@
     return JSON.parse(JSON.stringify(value));
   }
 
-  function createMockTemplateApi() {
-    const templates = [];
-
-    return {
-      async listTemplates() {
-        console.info('[mock-template-api] list', { count: templates.length });
-        return clone(templates);
-      },
-
-      async saveTemplate(data) {
-        const template = {
-          id: globalThis.crypto?.randomUUID?.() || String(Date.now()),
-          data: clone(data),
-        };
-        templates.push(template);
-        console.info('[mock-template-api] save', {
-          id: template.id,
-          objectCount: template.data.objects.length,
-        });
-        return clone(template);
-      },
-
-      async deleteTemplate(id) {
-        const index = templates.findIndex(template => template.id === id);
-        if (index !== -1) {
-          templates.splice(index, 1);
-        }
-        console.info('[mock-template-api] delete', { id });
-        return index !== -1;
-      },
-    };
-  }
-
   function loadFabricImage(source) {
     return new Promise((resolve, reject) => {
       fabric.Image.fromURL(source, image => {
@@ -430,7 +397,6 @@
       'clear',
       'fullscreen',
     ];
-    const templateApi = createMockTemplateApi();
     const translate = (russian, english) => (
       window.lang === 'ru' ? russian : english
     );
@@ -3142,16 +3108,53 @@
       captureActiveLayout();
     }
 
-    async function runTemplateImport() {
-      if (!importFiles || importBusy) return;
+    function snapshotProjectState() {
+      captureActiveLayout();
+      return {
+        activeLayout,
+        projectName,
+        mirrorSecondStrip,
+        projectTrim: { ...projectTrim },
+        layoutLabels: { ...layoutLabels },
+        layouts: clone(layoutDocuments),
+        fonts: [...fontAssets.entries()],
+      };
+    }
+
+    async function restoreProjectSnapshot(snapshot) {
+      projectName = snapshot.projectName;
+      mirrorSecondStrip = snapshot.mirrorSecondStrip;
+      projectTrim = { ...snapshot.projectTrim };
+      Object.assign(layoutLabels, snapshot.layoutLabels);
+      Object.keys(layoutDocuments).forEach(layout => {
+        layoutDocuments[layout] = clone(snapshot.layouts[layout]);
+      });
+      fontAssets.clear();
+      snapshot.fonts.forEach(([fileName, asset]) => {
+        fontAssets.set(fileName, asset);
+      });
+      renderLocalFontOptions();
+      exportControls.name.value = projectName;
+      await loadLayout(snapshot.activeLayout);
+    }
+
+    async function runTemplateImport(options = {}) {
+      if (!importFiles || importBusy) return false;
 
       importBusy = true;
       importControls.package.disabled = true;
       importControls.folder.disabled = true;
       setLayoutTabsDisabled(true);
-      setImportStatus(translate('Проверяю шаблон…', 'Checking template…'));
+      const report = (message, type = '') => {
+        setImportStatus(message, type);
+        options.onStatus?.(message, type);
+      };
+      report(translate('Проверяю шаблон…', 'Checking template…'));
 
       const previousRestoring = isRestoringDraft;
+      const snapshot = snapshotProjectState();
+      let projectMutationStarted = false;
+      let imported = false;
       try {
         const configEntry = packageConfigEntry(importFiles);
         const configText = configEntry.value instanceof File
@@ -3181,20 +3184,23 @@
         if (resolvedFonts.missing.length) {
           missingImportFonts = resolvedFonts.missing;
           importControls.fonts.hidden = false;
-          setImportStatus(translate(
+          report(translate(
             `Не найдены шрифты: ${missingImportFonts.join(', ')}`,
             `Missing fonts: ${missingImportFonts.join(', ')}`,
           ), 'error');
-          return;
+          return false;
         }
 
         clearMissingImportFonts();
+        report(translate('Загружаю изображения…', 'Loading images…'));
         const prepared = await Promise.all(definitions.map(async definition => ({
           definition,
           images: await prepareImportedImages(importFiles, configEntry.root, definition),
         })));
 
         isRestoringDraft = true;
+        projectMutationStarted = true;
+        imgEditor.canvas.projectRevision = (imgEditor.canvas.projectRevision || 0) + 1;
         mirrorSecondStrip = definitions.find(
           definition => definition.key === 'strips',
         )?.mirrorSecondStrip !== false;
@@ -3207,12 +3213,12 @@
         for (const item of prepared) {
           await applyImportedLayout(item.definition, item.images, resolvedFonts.assets);
         }
-        projectName = configEntry.root
+        projectName = options.projectName || (configEntry.root
           ? configEntry.root.replace(/\/$/, '').split('/').pop()
-          : (importControls.package.files?.[0]?.name.replace(/\.zip$/i, '') || 'template');
+          : (importControls.package.files?.[0]?.name.replace(/\.zip$/i, '') || 'template'));
         exportControls.name.value = projectName;
         if (activeLayout !== 'grid') await loadLayout('grid');
-        setImportStatus(
+        report(
           translate('Грид и стрипсы импортированы', 'Grid and strips were imported'),
           'success',
         );
@@ -3220,9 +3226,17 @@
           translate('Шаблон импортирован', 'Template imported'),
           'Success',
         );
+        imported = true;
       } catch (error) {
         console.error('[template-studio] import error', error);
-        setImportStatus(error.message, 'error');
+        if (projectMutationStarted) {
+          try {
+            await restoreProjectSnapshot(snapshot);
+          } catch (restoreError) {
+            console.error('[template-studio] import rollback error', restoreError);
+          }
+        }
+        report(error.message, 'error');
       } finally {
         isRestoringDraft = previousRestoring;
         importBusy = false;
@@ -3231,7 +3245,8 @@
         setLayoutTabsDisabled(false);
         renderExportSummary();
       }
-      if (!previousRestoring) await flushDraftSave();
+      if (imported && !previousRestoring) await flushDraftSave();
+      return imported;
     }
 
     importControls.package.addEventListener('change', async event => {
@@ -3478,95 +3493,200 @@
 
     renderExportSummary();
 
-    function canvasObjectsWithPositioning() {
-      const { width, height } = activeProfile();
-      const canvasData = imgEditor.canvas.toJSON([
-        'uniqueId',
-        'kind',
-        'photoIndex',
-        'excludeFromExport',
-        'excludeFromHistory',
-        'fontFile',
-      ]);
+    const templateGallery = {
+      panel: document.querySelector(`${imgEditor.containerSelector} #export-template-panel`),
+      list: document.querySelector(
+        `${imgEditor.containerSelector} #export-template-panel .list-templates`,
+      ),
+      status: document.querySelector(
+        `${imgEditor.containerSelector} #export-template-panel .template-gallery-status`,
+      ),
+    };
+    let templateGalleryBusy = false;
 
-      return canvasData.objects
-        .filter(object => !object.excludeFromExport && object.kind !== 'photo-slot')
-        .map(object => {
-          const leftOffset = object.left;
-          const topOffset = object.top;
-          const rightOffset = width - leftOffset;
-          const bottomOffset = height - topOffset;
-          const nearestXSide = leftOffset <= rightOffset ? 'left' : 'right';
-          const nearestYSide = topOffset <= bottomOffset ? 'top' : 'bottom';
-
-          return {
-            ...object,
-            positioning: {
-              xOffset: nearestXSide === 'left' ? leftOffset : rightOffset,
-              yOffset: nearestYSide === 'top' ? topOffset : bottomOffset,
-              nearestXSide,
-              nearestYSide,
-            },
-          };
-        });
+    function validTemplateFolderName(value) {
+      const name = typeof value === 'string' ? value.trim() : '';
+      return name
+        && name !== '.'
+        && name !== '..'
+        && !name.includes('/')
+        && !name.includes('\\')
+        ? name
+        : null;
     }
 
-    function templateThumbnail() {
-      const { width, height } = activeProfile();
-      const currentZoom = imgEditor.canvas.getZoom();
-      const multiplier = Math.min(200 / width, 200 / height);
-      const photoSlots = imgEditor.canvas.getObjects()
-        .filter(object => object.kind === 'photo-slot');
-      const visibility = photoSlots.map(slot => slot.visible);
+    function templateAssetURL(folder, fileName) {
+      const path = normalizedArchivePath(fileName);
+      const encodedPath = path.split('/').map(encodeURIComponent).join('/');
+      return `./templates/${encodeURIComponent(folder)}/${encodedPath}`;
+    }
 
-      photoSlots.forEach(slot => slot.set('visible', true));
-      imgEditor.applyZoom(1);
+    async function fetchTemplateAsset(folder, fileName, required = true) {
+      const response = await fetch(templateAssetURL(folder, fileName), { cache: 'no-store' });
+      if (!response.ok) {
+        if (!required && response.status === 404) return null;
+        throw templateImportError(
+          `Не удалось загрузить ${folder}/${fileName}: HTTP ${response.status}`,
+          `Could not load ${folder}/${fileName}: HTTP ${response.status}`,
+        );
+      }
+      return new Uint8Array(await response.arrayBuffer());
+    }
+
+    async function downloadTemplateFolder(folder, onStatus) {
+      onStatus(translate('Загружаю config.json…', 'Loading config.json…'));
+      const configBytes = await fetchTemplateAsset(folder, 'config.json');
+      let config;
       try {
-        return imgEditor.canvas.toDataURL({
-          format: 'png',
-          multiplier,
-          width,
-          height,
-        });
-      } finally {
-        photoSlots.forEach((slot, index) => {
-          slot.set('visible', visibility[index]);
-        });
-        imgEditor.applyZoom(currentZoom);
-        imgEditor.canvas.requestRenderAll();
+        config = JSON.parse(new TextDecoder().decode(configBytes));
+      } catch (_error) {
+        throw templateImportError(
+          `В ${folder}/config.json некорректный JSON`,
+          `${folder}/config.json contains invalid JSON`,
+        );
+      }
+
+      validatedImportedConfig(config);
+      const definitions = [
+        importedGridDefinition(config),
+        importedStripsDefinition(config),
+      ];
+      const requiredAssets = new Set(definitions.flatMap(definition => [
+        definition.background,
+        definition.foreground,
+      ]).filter(Boolean));
+      const fontAssetsToTry = new Set(
+        definitions.flatMap(definition => definition.texts.map(block => block.font)),
+      );
+      const assets = [
+        ...[...requiredAssets].map(fileName => ({ fileName, required: true })),
+        ...[...fontAssetsToTry]
+          .filter(fileName => !requiredAssets.has(fileName))
+          .map(fileName => ({ fileName, required: false })),
+      ];
+      const root = `${folder}/`;
+      const files = new Map([[`${root}config.json`, configBytes]]);
+      let completed = 0;
+
+      await Promise.all(assets.map(async asset => {
+        const bytes = await fetchTemplateAsset(folder, asset.fileName, asset.required);
+        completed += 1;
+        onStatus(translate(
+          `Загружено файлов: ${completed} из ${assets.length}`,
+          `Loaded files: ${completed} of ${assets.length}`,
+        ));
+        if (bytes) {
+          files.set(
+            normalizedArchivePath(`${root}${asset.fileName}`),
+            bytes,
+          );
+        }
+      }));
+
+      return files;
+    }
+
+    function templateLoadingModal(folder) {
+      document.querySelector('.template-loading-modal')?.remove();
+      const modal = document.createElement('div');
+      modal.className = 'custom-modal-container template-loading-modal';
+      modal.setAttribute('role', 'dialog');
+      modal.setAttribute('aria-modal', 'true');
+      modal.innerHTML = `
+        <div class="custom-modal-content template-loading-content">
+          <span class="template-loading-spinner" aria-hidden="true"></span>
+          <strong></strong>
+          <p role="status"></p>
+          <button type="button" hidden>${translate('Закрыть', 'Close')}</button>
+        </div>
+      `;
+      const title = modal.querySelector('strong');
+      const status = modal.querySelector('[role="status"]');
+      const close = modal.querySelector('button');
+      title.textContent = translate(`Загрузка «${folder}»`, `Loading “${folder}”`);
+      close.addEventListener('click', () => modal.remove());
+      document.body.appendChild(modal);
+
+      return {
+        setStatus(message) {
+          status.textContent = message;
+        },
+        fail(message) {
+          modal.classList.add('error');
+          title.textContent = translate('Шаблон не загружен', 'Template was not loaded');
+          status.textContent = message;
+          close.hidden = false;
+        },
+        close() {
+          modal.remove();
+        },
+      };
+    }
+
+    function renderTemplateFolders(folders) {
+      templateGallery.list.replaceChildren();
+      folders.forEach(folder => {
+        const button = document.createElement('button');
+        const mark = document.createElement('span');
+        const name = document.createElement('strong');
+        button.className = 'template-folder-card';
+        button.type = 'button';
+        button.dataset.templateFolder = folder;
+        mark.className = 'template-folder-mark';
+        mark.textContent = 'TS';
+        name.textContent = folder;
+        button.append(mark, name);
+        templateGallery.list.appendChild(button);
+      });
+      templateGallery.list.hidden = folders.length === 0;
+      templateGallery.status.hidden = folders.length > 0;
+      templateGallery.status.textContent = translate(
+        'В manifest.json пока нет шаблонов.',
+        'There are no templates in manifest.json yet.',
+      );
+    }
+
+    async function reloadTemplateGallery() {
+      templateGallery.list.hidden = true;
+      templateGallery.status.hidden = false;
+      templateGallery.status.classList.remove('error');
+      templateGallery.status.textContent = translate(
+        'Обновляю список…',
+        'Refreshing list…',
+      );
+      try {
+        const response = await fetch('./templates/manifest.json', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const manifest = await response.json();
+        if (!Array.isArray(manifest)) {
+          throw new Error(translate(
+            'manifest.json должен содержать массив папок',
+            'manifest.json must contain an array of folders',
+          ));
+        }
+        const folders = [...new Set(manifest.map(validTemplateFolderName).filter(Boolean))]
+          .sort((left, right) => left.localeCompare(right, window.lang));
+        renderTemplateFolders(folders);
+      } catch (error) {
+        templateGallery.list.replaceChildren();
+        templateGallery.list.hidden = true;
+        templateGallery.status.hidden = false;
+        templateGallery.status.classList.add('error');
+        templateGallery.status.textContent = translate(
+          `Не удалось прочитать manifest.json: ${error.message}`,
+          `Could not read manifest.json: ${error.message}`,
+        );
       }
     }
 
-    let templates = [];
-    let deleteMode = false;
-
-    function renderTemplates() {
-      const list = document.querySelector(
-        `${imgEditor.containerSelector} #export-template-panel .list-templates`,
-      );
-      list.replaceChildren();
-
-      templates.forEach(template => {
-        const preview = document.createElement('div');
-        const image = document.createElement('img');
-        const deleteButton = document.createElement('button');
-
-        preview.className = `template-preview${deleteMode ? ' delete-mode' : ''}`;
-        preview.dataset.id = template.id;
-        image.src = template.data.thumb;
-        image.alt = 'Template preview';
-        deleteButton.className = 'delete-button';
-        deleteButton.type = 'button';
-        deleteButton.textContent = '×';
-        preview.append(image, deleteButton);
-        list.appendChild(preview);
+    document.querySelector(`${imgEditor.containerSelector} #toolbar #export-template`)
+      ?.addEventListener('click', () => {
+        requestAnimationFrame(() => {
+          if (templateGallery.panel.classList.contains('visible')) {
+            reloadTemplateGallery();
+          }
+        });
       });
-    }
-
-    async function reloadTemplates() {
-      templates = await templateApi.listTemplates();
-      renderTemplates();
-    }
 
     backgroundInput.addEventListener('change', async event => {
       const file = event.target.files?.[0];
@@ -3596,57 +3716,45 @@
       }
     });
 
-    document.addEventListener('click', async event => {
-      const preview = event.target.closest('.template-preview');
-      if (!preview) {
-        return;
-      }
+    templateGallery.list.addEventListener('click', async event => {
+      const card = event.target.closest('.template-folder-card');
+      const folder = validTemplateFolderName(card?.dataset.templateFolder);
+      if (!folder || templateGalleryBusy || importBusy) return;
 
-      const template = templates.find(item => item.id === preview.dataset.id);
-      if (!template) {
-        return;
-      }
-
-      if (deleteMode) {
-        await templateApi.deleteTemplate(template.id);
-        await reloadTemplates();
-        return;
-      }
-
-      imgEditor.setPhotoLayoutState(template.data.photoLayout);
-      imgEditor.applyTemplate(template.data.objects);
-    });
-
-    document.addEventListener('click', async event => {
-      if (event.target.closest('.app-new-template')) {
-        const template = await templateApi.saveTemplate({
-          thumb: templateThumbnail(),
-          objects: canvasObjectsWithPositioning(),
-          photoLayout: imgEditor.getPhotoLayoutState(),
-        });
-        templates.push(template);
-        renderTemplates();
-        imgEditor.toast(
-          window.lang === 'ru' ? 'Шаблон сохранён в памяти' : 'Template saved in memory',
-          'Success',
-        );
-        return;
-      }
-
-      const deleteButton = event.target.closest('.app-delete-template');
-      if (!deleteButton) {
-        return;
-      }
-
-      deleteMode = !deleteMode;
-      deleteButton.classList.toggle('active', deleteMode);
-      deleteButton.classList.toggle('delete-active', deleteMode);
-      deleteButton.textContent = deleteMode
-        ? (window.lang === 'ru' ? 'Готово' : 'Done')
-        : (window.lang === 'ru' ? 'Удаление' : 'Delete');
-      document.querySelectorAll('.template-preview').forEach(preview => {
-        preview.classList.toggle('delete-mode', deleteMode);
+      templateGalleryBusy = true;
+      templateGallery.list.querySelectorAll('button').forEach(button => {
+        button.disabled = true;
       });
+      const modal = templateLoadingModal(folder);
+      let lastStatus = translate('Начинаю загрузку…', 'Starting download…');
+      modal.setStatus(lastStatus);
+
+      try {
+        importFiles = await downloadTemplateFolder(folder, message => {
+          lastStatus = message;
+          modal.setStatus(message);
+        });
+        importControls.package.value = '';
+        importControls.folder.value = '';
+        const imported = await runTemplateImport({
+          projectName: folder,
+          onStatus(message) {
+            lastStatus = message;
+            modal.setStatus(message);
+          },
+        });
+        if (!imported) throw new Error(lastStatus);
+        modal.close();
+        importFiles = null;
+      } catch (error) {
+        console.error('[template-studio] gallery import error', error);
+        modal.fail(error.message || lastStatus);
+      } finally {
+        templateGalleryBusy = false;
+        templateGallery.list.querySelectorAll('button').forEach(button => {
+          button.disabled = false;
+        });
+      }
     });
 
     const draftEvents = [
@@ -3677,7 +3785,6 @@
       printSize: [PRINT_WIDTH, PRINT_HEIGHT],
       stripSize: [STRIP_WIDTH, STRIP_HEIGHT],
       background: backgroundState,
-      templateApi,
       setBackgroundFile,
       setBackgroundSource,
       setBackgroundFit,
@@ -3733,11 +3840,13 @@
       flushDraftSave();
     });
 
-    reloadTemplates().catch(error => {
-      console.error('[mock-template-api] could not load templates', error);
-    });
-
     document.querySelector('.appLoader')?.remove();
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        imgEditor.fitZoom();
+        imgEditor.refreshWorkspaceLayout?.();
+      });
+    });
     console.info('[template-studio] ready', {
       printSize: [PRINT_WIDTH, PRINT_HEIGHT],
       stripSize: [STRIP_WIDTH, STRIP_HEIGHT],
