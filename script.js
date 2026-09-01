@@ -1,6 +1,90 @@
 (function () {
   'use strict';
 
+  function colorByte(value) {
+    return Math.round(Math.max(0, Math.min(255, value)))
+      .toString(16)
+      .padStart(2, '0');
+  }
+
+  function colorToHex(value) {
+    const source = typeof value === 'string' ? value.trim().toLowerCase() : '';
+    const hex = source.match(/^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i);
+
+    if (hex) {
+      const digits = hex[1].length <= 4
+        ? [...hex[1]].map(character => character + character).join('')
+        : hex[1];
+      return `#${digits}`;
+    }
+
+    const color = value && typeof value.toRgb === 'function'
+      ? value
+      : window.tinycolor?.(value);
+    if (
+      !color
+      || typeof color.toRgb !== 'function'
+      || (typeof color.isValid === 'function' && !color.isValid())
+    ) {
+      return null;
+    }
+
+    const rgba = color.toRgb();
+    if (![rgba.r, rgba.g, rgba.b].every(Number.isFinite)) return null;
+
+    const alpha = colorByte((Number.isFinite(rgba.a) ? rgba.a : 1) * 255);
+    const rgb = `${colorByte(rgba.r)}${colorByte(rgba.g)}${colorByte(rgba.b)}`;
+    return `#${rgb}${alpha === 'ff' ? '' : alpha}`;
+  }
+
+  function spectrumInputColor(value) {
+    const hex = colorToHex(value);
+    if (!hex) return value;
+
+    return {
+      r: parseInt(hex.slice(1, 3), 16),
+      g: parseInt(hex.slice(3, 5), 16),
+      b: parseInt(hex.slice(5, 7), 16),
+      a: hex.length === 9 ? parseInt(hex.slice(7, 9), 16) / 255 : 1,
+    };
+  }
+
+  window.colorToHex = colorToHex;
+  window.spectrumInputColor = spectrumInputColor;
+
+  // Spectrum 2.0.10 uses legacy #aarrggbb. Keep its UI in CSS #rrggbbaa,
+  // which is also the format consumed by the photobooth renderer.
+  if (window.tinycolor?.prototype) {
+    window.tinycolor.prototype.toHex8 = function () {
+      const rgba = this.toRgb();
+      return `${colorByte(rgba.r)}${colorByte(rgba.g)}${colorByte(rgba.b)}`
+        + colorByte((Number.isFinite(rgba.a) ? rgba.a : 1) * 255);
+    };
+  }
+
+  const prepareSpectrumTextInput = input => {
+    const hex = colorToHex(input.value);
+    if (hex?.length === 9) {
+      input.value = `#${hex.slice(7, 9)}${hex.slice(1, 7)}`;
+    }
+  };
+
+  document.addEventListener('change', event => {
+    if (event.target.matches?.('.sp-container .sp-input')) {
+      prepareSpectrumTextInput(event.target);
+    }
+  }, true);
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && event.target.matches?.('.sp-container .sp-input')) {
+      prepareSpectrumTextInput(event.target);
+    }
+  }, true);
+  document.addEventListener('paste', event => {
+    if (event.target.matches?.('.sp-container .sp-input')) {
+      setTimeout(() => prepareSpectrumTextInput(event.target));
+    }
+  }, true);
+
   const PRINT_WIDTH = 3688;
   const PRINT_HEIGHT = 2480;
   const STRIP_WIDTH = PRINT_HEIGHT / 2;
@@ -1833,32 +1917,7 @@
     }
 
     function normalizedColor(value, fallback = '#000000') {
-      const color = String(value || '').trim().toLowerCase();
-      const shortHex = color.match(/^#([0-9a-f]{3,4})$/i);
-      const fullHex = color.match(/^#([0-9a-f]{6}|[0-9a-f]{8})$/i);
-      const rgba = color.match(
-        /^rgba?\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)(?:\s*,\s*(\d*(?:\.\d+)?))?\s*\)$/i,
-      );
-
-      if (shortHex) {
-        return `#${[...shortHex[1]].map(character => character + character).join('')}`;
-      }
-      if (fullHex) {
-        return `#${fullHex[1]}`;
-      }
-      if (rgba) {
-        const channels = rgba.slice(1, 4).map(channel => (
-          Math.max(0, Math.min(255, Math.round(Number(channel))))
-        ));
-        const alpha = rgba[4] === undefined || rgba[4] === ''
-          ? 255
-          : Math.max(0, Math.min(255, Math.round(Number(rgba[4]) * 255)));
-        const digits = [...channels, ...(alpha < 255 ? [alpha] : [])]
-          .map(channel => channel.toString(16).padStart(2, '0'))
-          .join('');
-        return `#${digits}`;
-      }
-      return fallback;
+      return colorToHex(value) || colorToHex(fallback) || '#000000';
     }
 
     function colorWithOpacity(value, opacity, fallback = '#000000') {
