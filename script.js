@@ -165,7 +165,7 @@
     strips: '2 полоски',
   };
   const DRAFT_KEY = 'current-project-v3';
-  const STUDIO_FORMAT_VERSION = 1;
+  const STUDIO_FORMAT_VERSION = 2;
   const STUDIO_ASSET_DIRECTORY = 'studio_assets';
   const BACKGROUND_TYPES = new Set([
     'image/jpeg',
@@ -1145,25 +1145,35 @@
       }
     }
 
+    const canvasCustomProperties = [
+      'uniqueId',
+      'kind',
+      'photoIndex',
+      'excludeFromExport',
+      'excludeFromHistory',
+      'assetFileName',
+      'assetFileSize',
+      'backgroundFitMode',
+      'previewType',
+      'previewFileName',
+      'photoAspectRatio',
+      'photoSymmetryEnabled',
+      'photoSymmetryOffsetX',
+      'photoSymmetryOffsetY',
+      'photoColumnEnabled',
+      'photoColumnGap',
+      'fontFile',
+    ];
+
     function canvasDraftJSON() {
-      return imgEditor.canvas.toJSON([
-        'uniqueId',
-        'kind',
-        'photoIndex',
-        'excludeFromExport',
-        'excludeFromHistory',
+      return imgEditor.canvas.toJSON(canvasCustomProperties);
+    }
+
+    function studioObjectJSON(object) {
+      return object.toObject([
         'assetFileName',
         'assetFileSize',
         'backgroundFitMode',
-        'previewType',
-        'previewFileName',
-        'photoAspectRatio',
-        'photoSymmetryEnabled',
-        'photoSymmetryOffsetX',
-        'photoSymmetryOffsetY',
-        'photoColumnEnabled',
-        'photoColumnGap',
-        'fontFile',
       ]);
     }
 
@@ -1347,7 +1357,7 @@
       return name || fallback;
     }
 
-    function exportedStudioProject() {
+    function exportedStudioProject(layouts) {
       const files = [];
       const pathsBySource = new Map();
 
@@ -1378,17 +1388,12 @@
         return result;
       };
 
-      const layouts = externalize({
-        grid: persistedLayout(layoutDocuments.grid),
-        strips: persistedLayout(layoutDocuments.strips),
-      });
+      const exportedLayouts = externalize(layouts);
 
       return {
         definition: {
           version: STUDIO_FORMAT_VERSION,
-          active_layout: activeLayout,
-          assets: files.map(file => file.name),
-          layouts,
+          layouts: exportedLayouts,
         },
         files,
       };
@@ -2078,87 +2083,41 @@
 
     function importedStudioProject(config) {
       const studio = config?._studio;
-      if (!studio || studio.version !== STUDIO_FORMAT_VERSION) return null;
+      const validLayout = layout => (
+        layout?.background?.fill
+        && (layout.background.image === null || typeof layout.background.image === 'object')
+        && Array.isArray(layout.layers?.before_photos)
+        && Array.isArray(layout.layers?.after_photos)
+      );
+      if (
+        !studio
+        || studio.version !== STUDIO_FORMAT_VERSION
+        || !validLayout(studio.layouts?.grid)
+        || !validLayout(studio.layouts?.strips)
+      ) return null;
 
       const layouts = studio.layouts;
-      if (
-        !['grid', 'strips'].includes(studio.active_layout)
-        || !layouts?.grid?.canvas
-        || !Array.isArray(layouts.grid.canvas.objects)
-        || !layouts?.strips?.canvas
-        || !Array.isArray(layouts.strips.canvas.objects)
-        || !Array.isArray(studio.assets)
-      ) {
-        throw templateImportError(
-          'В config.json повреждены данные Template Studio',
-          'The Template Studio data in config.json is damaged',
-        );
-      }
-
-      let assets;
+      const assets = new Set();
       try {
-        assets = [...new Set(studio.assets.map(path => normalizedArchivePath(path)))];
+        walkStudioValue(layouts, value => {
+          if (
+            typeof value.src === 'string'
+            && value.src.startsWith(`${STUDIO_ASSET_DIRECTORY}/`)
+          ) {
+            assets.add(normalizedArchivePath(value.src));
+          }
+        });
       } catch (_error) {
         throw templateImportError(
           'В Template Studio указан некорректный путь к исходнику',
           'The Template Studio data contains an invalid asset path',
         );
       }
-      if (assets.some(path => !path.startsWith(`${STUDIO_ASSET_DIRECTORY}/`))) {
-        throw templateImportError(
-          'Исходники Template Studio должны лежать в studio_assets',
-          'Template Studio assets must be stored in studio_assets',
-        );
-      }
-
-      const assetSet = new Set(assets);
-      let missingReference = null;
-      walkStudioValue(layouts, value => {
-        if (
-          typeof value.src === 'string'
-          && value.src.startsWith(`${STUDIO_ASSET_DIRECTORY}/`)
-          && !assetSet.has(value.src)
-        ) {
-          missingReference = value.src;
-        }
-      });
-      if (missingReference) {
-        throw templateImportError(
-          `В Template Studio нет исходника ${missingReference}`,
-          `Template Studio asset ${missingReference} is not listed`,
-        );
-      }
 
       return {
-        activeLayout: studio.active_layout,
-        assets,
+        assets: [...assets],
         layouts: clone(layouts),
       };
-    }
-
-    function studioFontFileNames(studio) {
-      const fileNames = new Set();
-      if (!studio) return fileNames;
-      walkStudioValue(studio.layouts, value => {
-        if (
-          typeof value.fontFile === 'string'
-          && FONT_FILE_PATTERN.test(value.fontFile)
-          && !value.fontFile.includes('/')
-          && !value.fontFile.includes('\\')
-        ) {
-          fileNames.add(value.fontFile);
-        }
-      });
-      return fileNames;
-    }
-
-    function remapStudioFontFamilies(layouts) {
-      walkStudioValue(layouts, value => {
-        const asset = typeof value.fontFile === 'string'
-          ? fontAssets.get(value.fontFile)
-          : null;
-        if (asset && textTypes.has(value.type)) value.fontFamily = asset.family;
-      });
     }
 
     function normalizedAngle(value) {
@@ -2923,6 +2882,7 @@
       const usedFonts = new Map();
       const templates = {};
       const images = [];
+      const studioLayouts = {};
 
       captureActiveLayout();
       try {
@@ -2931,7 +2891,20 @@
             await loadLayout(layout);
           }
           await ensureOnlineFontAssets();
-          const hasForeground = activeStaticLayers().foreground.length > 0;
+          const staticLayers = activeStaticLayers();
+          const hasForeground = staticLayers.foreground.length > 0;
+          studioLayouts[layout] = {
+            background: {
+              fill: cloneBackgroundFillState(activeBackgroundFillState),
+              image: imgEditor.canvas.backgroundImage
+                ? studioObjectJSON(imgEditor.canvas.backgroundImage)
+                : null,
+            },
+            layers: {
+              before_photos: staticLayers.background.map(studioObjectJSON),
+              after_photos: staticLayers.foreground.map(studioObjectJSON),
+            },
+          };
           templates[layout] = layout === 'grid'
             ? gridTemplate(usedFonts, hasForeground)
             : stripsTemplate(usedFonts, hasForeground);
@@ -2965,7 +2938,7 @@
         queueDraftSave();
       }
 
-      const studio = exportedStudioProject();
+      const studio = exportedStudioProject(studioLayouts);
 
       return {
         name,
@@ -3243,8 +3216,23 @@
           value.src = sources.get(value.src);
         }
       });
-      remapStudioFontFamilies(layouts);
       return layouts;
+    }
+
+    function enlivenStudioObjects(objects) {
+      return new Promise((resolve, reject) => {
+        try {
+          fabric.util.enlivenObjects(objects, result => {
+            if (result.length !== objects.length) {
+              reject(new Error('Could not restore a Template Studio object'));
+              return;
+            }
+            resolve(result);
+          });
+        } catch (error) {
+          reject(error);
+        }
+      });
     }
 
     async function bitmapFromPackageAsset(value, name) {
@@ -3309,7 +3297,7 @@
       };
     }
 
-    async function applyImportedLayout(definition, images, fonts) {
+    async function applyImportedLayout(definition, images, fonts, studioLayout = null) {
       const canvas = imgEditor.canvas;
       const previousHistoryProcessing = canvas.historyProcessing;
       canvas.historyProcessing = true;
@@ -3318,13 +3306,33 @@
         await loadLayout(definition.key);
         canvas.historyProcessing = true;
         clearCanvasDocument();
-        activeBackgroundFillState = defaultBackgroundFillState();
+        activeBackgroundFillState = studioLayout
+          ? cloneBackgroundFillState(studioLayout.background.fill)
+          : defaultBackgroundFillState();
         imgEditor.setBackgroundFillState(definition.key, activeBackgroundFillState);
-        const backgroundImage = await imageFromPNGBytes(images.background);
-        await installBackgroundImage(backgroundImage, {
-          fileName: definition.background,
-          fileSize: images.background.length,
-        }, 'cover');
+
+        if (studioLayout?.background.image) {
+          const [backgroundImage] = await enlivenStudioObjects([
+            studioLayout.background.image,
+          ]);
+          await installBackgroundImage(backgroundImage, {
+            fileName: backgroundImage.assetFileName || definition.background,
+            fileSize: backgroundImage.assetFileSize || null,
+          }, backgroundImage.backgroundFitMode === 'stretch' ? 'stretch' : 'cover');
+        } else if (!studioLayout) {
+          const backgroundImage = await imageFromPNGBytes(images.background);
+          await installBackgroundImage(backgroundImage, {
+            fileName: definition.background,
+            fileSize: images.background.length,
+          }, 'cover');
+        } else {
+          Object.assign(backgroundState, emptyBackgroundState());
+        }
+
+        if (studioLayout) {
+          const objects = await enlivenStudioObjects(studioLayout.layers.before_photos);
+          canvas.add(...objects);
+        }
 
         if (!imgEditor.setPhotoLayoutState({
           photos: definition.photos,
@@ -3336,7 +3344,10 @@
           );
         }
 
-        if (images.foreground) {
+        if (studioLayout) {
+          const objects = await enlivenStudioObjects(studioLayout.layers.after_photos);
+          canvas.add(...objects);
+        } else if (images.foreground) {
           const foreground = await imageFromPNGBytes(images.foreground);
           foreground.set({
             left: 0,
@@ -3434,7 +3445,6 @@
         const referencedFonts = new Set(
           definitions.flatMap(definition => definition.texts.map(block => block.font)),
         );
-        studioFontFileNames(studio).forEach(fileName => referencedFonts.add(fileName));
         for (const fileName of referencedFonts) {
           const value = importFiles.get(normalizedArchivePath(`${configEntry.root}${fileName}`));
           if (value) {
@@ -3445,13 +3455,9 @@
         const resolvedFonts = await resolveImportedFonts(
           definitions.flatMap(definition => definition.texts),
         );
-        const missingFonts = [...new Set([
-          ...resolvedFonts.missing,
-          ...[...studioFontFileNames(studio)].filter(fileName => !fontAssets.has(fileName)),
-        ])];
 
-        if (missingFonts.length) {
-          missingImportFonts = missingFonts;
+        if (resolvedFonts.missing.length) {
+          missingImportFonts = resolvedFonts.missing;
           importControls.fonts.hidden = false;
           report(translate(
             `Не найдены шрифты: ${missingImportFonts.join(', ')}`,
@@ -3465,9 +3471,11 @@
         const studioLayouts = studio
           ? await prepareImportedStudioLayouts(studio, importFiles, configEntry.root)
           : null;
-        const prepared = studio ? [] : await Promise.all(definitions.map(async definition => ({
+        const prepared = await Promise.all(definitions.map(async definition => ({
           definition,
-          images: await prepareImportedImages(importFiles, configEntry.root, definition),
+          images: studio
+            ? null
+            : await prepareImportedImages(importFiles, configEntry.root, definition),
         })));
 
         isRestoringDraft = true;
@@ -3490,21 +3498,15 @@
           : (importControls.package.files?.[0]?.name.replace(/\.zip$/i, '') || 'template'));
         exportControls.name.value = projectName;
 
-        if (studioLayouts) {
-          Object.keys(layoutDocuments).forEach(layout => {
-            layoutDocuments[layout] = {
-              ...studioLayouts[layout],
-              historyUndo: [],
-              historyRedo: [],
-            };
-          });
-          await loadLayout(studio.activeLayout);
-        } else {
-          for (const item of prepared) {
-            await applyImportedLayout(item.definition, item.images, resolvedFonts.assets);
-          }
-          if (activeLayout !== 'grid') await loadLayout('grid');
+        for (const item of prepared) {
+          await applyImportedLayout(
+            item.definition,
+            item.images,
+            resolvedFonts.assets,
+            studioLayouts?.[item.definition.key] || null,
+          );
         }
+        if (activeLayout !== 'grid') await loadLayout('grid');
         report(
           studio
             ? translate(
@@ -3858,7 +3860,6 @@
       const fontAssetsToTry = new Set(
         definitions.flatMap(definition => definition.texts.map(block => block.font)),
       );
-      studioFontFileNames(studio).forEach(fileName => fontAssetsToTry.add(fileName));
       const assets = [
         ...[...requiredAssets].map(fileName => ({ fileName, required: true })),
         ...[...fontAssetsToTry]
