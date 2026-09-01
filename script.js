@@ -165,6 +165,8 @@
     strips: '2 полоски',
   };
   const DRAFT_KEY = 'current-project-v3';
+  const STUDIO_FORMAT_VERSION = 1;
+  const STUDIO_ASSET_DIRECTORY = 'studio_assets';
   const BACKGROUND_TYPES = new Set([
     'image/jpeg',
     'image/png',
@@ -350,6 +352,9 @@
       jpg: 'image/jpeg',
       jpeg: 'image/jpeg',
       webp: 'image/webp',
+      gif: 'image/gif',
+      svg: 'image/svg+xml',
+      avif: 'image/avif',
       ttf: 'font/ttf',
       otf: 'font/otf',
     }[extension] || 'application/octet-stream';
@@ -1319,6 +1324,76 @@
       };
     }
 
+    function studioImageExtension(source) {
+      const mimeType = /^data:([^;,]+)/i.exec(source)?.[1]?.toLowerCase();
+      return {
+        'image/png': 'png',
+        'image/jpeg': 'jpg',
+        'image/webp': 'webp',
+        'image/gif': 'gif',
+        'image/svg+xml': 'svg',
+        'image/avif': 'avif',
+      }[mimeType] || null;
+    }
+
+    function studioAssetStem(fileName, fallback) {
+      const name = String(fileName || '')
+        .split(/[\\/]/)
+        .pop()
+        .replace(/\.[^.]*$/, '')
+        .replace(/[^a-z0-9_-]+/gi, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 64);
+      return name || fallback;
+    }
+
+    function exportedStudioProject() {
+      const files = [];
+      const pathsBySource = new Map();
+
+      const externalize = value => {
+        if (Array.isArray(value)) return value.map(externalize);
+        if (!value || typeof value !== 'object') return value;
+
+        const result = {};
+        Object.entries(value).forEach(([key, child]) => {
+          const extension = key === 'src' && typeof child === 'string'
+            ? studioImageExtension(child)
+            : null;
+          if (!extension) {
+            result[key] = externalize(child);
+            return;
+          }
+
+          let path = pathsBySource.get(child);
+          if (!path) {
+            const number = String(files.length + 1).padStart(3, '0');
+            const stem = studioAssetStem(value.assetFileName, `image_${number}`);
+            path = `${STUDIO_ASSET_DIRECTORY}/${number}_${stem}.${extension}`;
+            pathsBySource.set(child, path);
+            files.push({ name: path, data: dataURLToBytes(child) });
+          }
+          result[key] = path;
+        });
+        return result;
+      };
+
+      const layouts = externalize({
+        grid: persistedLayout(layoutDocuments.grid),
+        strips: persistedLayout(layoutDocuments.strips),
+      });
+
+      return {
+        definition: {
+          version: STUDIO_FORMAT_VERSION,
+          active_layout: activeLayout,
+          assets: files.map(file => file.name),
+          layouts,
+        },
+        files,
+      };
+    }
+
     function clearCanvasDocument() {
       const canvas = imgEditor.canvas;
       canvas.discardActiveObject();
@@ -1989,6 +2064,101 @@
         );
       }
       return trim;
+    }
+
+    function walkStudioValue(value, visitor) {
+      if (!value || typeof value !== 'object') return;
+      visitor(value);
+      if (Array.isArray(value)) {
+        value.forEach(child => walkStudioValue(child, visitor));
+        return;
+      }
+      Object.values(value).forEach(child => walkStudioValue(child, visitor));
+    }
+
+    function importedStudioProject(config) {
+      const studio = config?._studio;
+      if (!studio || studio.version !== STUDIO_FORMAT_VERSION) return null;
+
+      const layouts = studio.layouts;
+      if (
+        !['grid', 'strips'].includes(studio.active_layout)
+        || !layouts?.grid?.canvas
+        || !Array.isArray(layouts.grid.canvas.objects)
+        || !layouts?.strips?.canvas
+        || !Array.isArray(layouts.strips.canvas.objects)
+        || !Array.isArray(studio.assets)
+      ) {
+        throw templateImportError(
+          'В config.json повреждены данные Template Studio',
+          'The Template Studio data in config.json is damaged',
+        );
+      }
+
+      let assets;
+      try {
+        assets = [...new Set(studio.assets.map(path => normalizedArchivePath(path)))];
+      } catch (_error) {
+        throw templateImportError(
+          'В Template Studio указан некорректный путь к исходнику',
+          'The Template Studio data contains an invalid asset path',
+        );
+      }
+      if (assets.some(path => !path.startsWith(`${STUDIO_ASSET_DIRECTORY}/`))) {
+        throw templateImportError(
+          'Исходники Template Studio должны лежать в studio_assets',
+          'Template Studio assets must be stored in studio_assets',
+        );
+      }
+
+      const assetSet = new Set(assets);
+      let missingReference = null;
+      walkStudioValue(layouts, value => {
+        if (
+          typeof value.src === 'string'
+          && value.src.startsWith(`${STUDIO_ASSET_DIRECTORY}/`)
+          && !assetSet.has(value.src)
+        ) {
+          missingReference = value.src;
+        }
+      });
+      if (missingReference) {
+        throw templateImportError(
+          `В Template Studio нет исходника ${missingReference}`,
+          `Template Studio asset ${missingReference} is not listed`,
+        );
+      }
+
+      return {
+        activeLayout: studio.active_layout,
+        assets,
+        layouts: clone(layouts),
+      };
+    }
+
+    function studioFontFileNames(studio) {
+      const fileNames = new Set();
+      if (!studio) return fileNames;
+      walkStudioValue(studio.layouts, value => {
+        if (
+          typeof value.fontFile === 'string'
+          && FONT_FILE_PATTERN.test(value.fontFile)
+          && !value.fontFile.includes('/')
+          && !value.fontFile.includes('\\')
+        ) {
+          fileNames.add(value.fontFile);
+        }
+      });
+      return fileNames;
+    }
+
+    function remapStudioFontFamilies(layouts) {
+      walkStudioValue(layouts, value => {
+        const asset = typeof value.fontFile === 'string'
+          ? fontAssets.get(value.fontFile)
+          : null;
+        if (asset && textTypes.has(value.type)) value.fontFamily = asset.family;
+      });
     }
 
     function normalizedAngle(value) {
@@ -2795,14 +2965,18 @@
         queueDraftSave();
       }
 
+      const studio = exportedStudioProject();
+
       return {
         name,
         usedFonts,
         images,
+        studioAssets: studio.files,
         config: {
           print_size: [PRINT_WIDTH, PRINT_HEIGHT],
           print_trim: printTrimConfig(),
           templates,
+          _studio: studio.definition,
         },
       };
     }
@@ -2876,7 +3050,7 @@
       return files;
     }
 
-    function exportedProjectFiles(config, usedFonts, images) {
+    function exportedProjectFiles(config, usedFonts, images, studioAssets = []) {
       const encoder = new TextEncoder();
       return [
         {
@@ -2884,6 +3058,7 @@
           data: encoder.encode(`${JSON.stringify(config, null, 2)}\n`),
         },
         ...images,
+        ...studioAssets,
         ...packagedFontFiles(usedFonts, encoder),
       ];
     }
@@ -2976,7 +3151,15 @@
         project.config,
         project.usedFonts,
         project.images,
+        project.studioAssets,
       );
+      const directories = [...new Set(files
+        .map(file => file.name.includes('/') ? file.name.slice(0, file.name.lastIndexOf('/')) : '')
+        .filter(Boolean))]
+        .sort((left, right) => left.split('/').length - right.split('/').length);
+      for (const directory of directories) {
+        await ensureYadiskDirectory(`${target}/${directory}`, token);
+      }
       const ordered = [
         ...files.filter(file => file.name !== 'config.json'),
         ...files.filter(file => file.name === 'config.json'),
@@ -3041,6 +3224,27 @@
         throw templateImportError(`Не найден файл ${name}`, `File ${name} was not found`);
       }
       return value;
+    }
+
+    async function prepareImportedStudioLayouts(studio, files, root) {
+      const sources = new Map();
+      await Promise.all(studio.assets.map(async path => {
+        const value = packageAsset(files, root, path);
+        const bytes = await packageFileBytes(value);
+        const source = await readFileAsDataURL(new Blob([bytes], {
+          type: mimeTypeForName(path),
+        }));
+        sources.set(path, source);
+      }));
+
+      const layouts = clone(studio.layouts);
+      walkStudioValue(layouts, value => {
+        if (typeof value.src === 'string' && sources.has(value.src)) {
+          value.src = sources.get(value.src);
+        }
+      });
+      remapStudioFontFamilies(layouts);
+      return layouts;
     }
 
     async function bitmapFromPackageAsset(value, name) {
@@ -3225,10 +3429,12 @@
           importedGridDefinition(config),
           importedStripsDefinition(config),
         ];
+        const studio = importedStudioProject(config);
 
         const referencedFonts = new Set(
           definitions.flatMap(definition => definition.texts.map(block => block.font)),
         );
+        studioFontFileNames(studio).forEach(fileName => referencedFonts.add(fileName));
         for (const fileName of referencedFonts) {
           const value = importFiles.get(normalizedArchivePath(`${configEntry.root}${fileName}`));
           if (value) {
@@ -3239,9 +3445,13 @@
         const resolvedFonts = await resolveImportedFonts(
           definitions.flatMap(definition => definition.texts),
         );
+        const missingFonts = [...new Set([
+          ...resolvedFonts.missing,
+          ...[...studioFontFileNames(studio)].filter(fileName => !fontAssets.has(fileName)),
+        ])];
 
-        if (resolvedFonts.missing.length) {
-          missingImportFonts = resolvedFonts.missing;
+        if (missingFonts.length) {
+          missingImportFonts = missingFonts;
           importControls.fonts.hidden = false;
           report(translate(
             `Не найдены шрифты: ${missingImportFonts.join(', ')}`,
@@ -3252,7 +3462,10 @@
 
         clearMissingImportFonts();
         report(translate('Загружаю изображения…', 'Loading images…'));
-        const prepared = await Promise.all(definitions.map(async definition => ({
+        const studioLayouts = studio
+          ? await prepareImportedStudioLayouts(studio, importFiles, configEntry.root)
+          : null;
+        const prepared = studio ? [] : await Promise.all(definitions.map(async definition => ({
           definition,
           images: await prepareImportedImages(importFiles, configEntry.root, definition),
         })));
@@ -3269,16 +3482,36 @@
           right: trim.right,
           bottom: trim.bottom,
         };
-        for (const item of prepared) {
-          await applyImportedLayout(item.definition, item.images, resolvedFonts.assets);
-        }
+        definitions.forEach(definition => {
+          layoutLabels[definition.key] = definition.label;
+        });
         projectName = options.projectName || (configEntry.root
           ? configEntry.root.replace(/\/$/, '').split('/').pop()
           : (importControls.package.files?.[0]?.name.replace(/\.zip$/i, '') || 'template'));
         exportControls.name.value = projectName;
-        if (activeLayout !== 'grid') await loadLayout('grid');
+
+        if (studioLayouts) {
+          Object.keys(layoutDocuments).forEach(layout => {
+            layoutDocuments[layout] = {
+              ...studioLayouts[layout],
+              historyUndo: [],
+              historyRedo: [],
+            };
+          });
+          await loadLayout(studio.activeLayout);
+        } else {
+          for (const item of prepared) {
+            await applyImportedLayout(item.definition, item.images, resolvedFonts.assets);
+          }
+          if (activeLayout !== 'grid') await loadLayout('grid');
+        }
         report(
-          translate('Грид и стрипсы импортированы', 'Grid and strips were imported'),
+          studio
+            ? translate(
+              'Редактируемый проект восстановлен',
+              'The editable project was restored',
+            )
+            : translate('Грид и стрипсы импортированы', 'Grid and strips were imported'),
           'success',
         );
         imgEditor.toast(
@@ -3458,8 +3691,14 @@
       setLayoutTabsDisabled(true);
 
       try {
-        const { name, config, usedFonts, images } = await exportProject(true);
-        const files = exportedProjectFiles(config, usedFonts, images);
+        const {
+          name,
+          config,
+          usedFonts,
+          images,
+          studioAssets,
+        } = await exportProject(true);
+        const files = exportedProjectFiles(config, usedFonts, images, studioAssets);
 
         downloadBlob(zipFiles(files), `${name}.zip`);
         imgEditor.toast(
@@ -3610,13 +3849,16 @@
         importedGridDefinition(config),
         importedStripsDefinition(config),
       ];
+      const studio = importedStudioProject(config);
       const requiredAssets = new Set(definitions.flatMap(definition => [
         definition.background,
         definition.foreground,
       ]).filter(Boolean));
+      studio?.assets.forEach(fileName => requiredAssets.add(fileName));
       const fontAssetsToTry = new Set(
         definitions.flatMap(definition => definition.texts.map(block => block.font)),
       );
+      studioFontFileNames(studio).forEach(fileName => fontAssetsToTry.add(fileName));
       const assets = [
         ...[...requiredAssets].map(fileName => ({ fileName, required: true })),
         ...[...fontAssetsToTry]
