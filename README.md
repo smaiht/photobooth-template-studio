@@ -4,7 +4,7 @@ Browser editor for photobooth print templates.
 
 [Open live demo →](https://studio.so.gl)
 
-video here <
+https://github.com/user-attachments/assets/83fa8b6d-d9aa-492b-9095-c552fdd15703
 
 ## Facts
 
