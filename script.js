@@ -194,7 +194,7 @@
     {
       family: 'Shantell Sans',
       label: 'Shantell Sans',
-      fileName: 'ShantellSans-VariableFont_BNCE,INFM,SPAC,wght.ttf',
+      fileName: 'ShantellSans.ttf',
       fontStyle: 'normal',
       weightMin: 300,
       weightMax: 800,
@@ -202,7 +202,7 @@
     {
       family: 'Shantell Sans',
       label: 'Shantell Sans',
-      fileName: 'ShantellSans-Italic-VariableFont_BNCE,INFM,SPAC,wght.ttf',
+      fileName: 'ShantellSans-Italic.ttf',
       fontStyle: 'italic',
       weightMin: 300,
       weightMax: 800,
@@ -603,23 +603,9 @@
       stripCopyPreview.classList.toggle('trim-cut-preview', showCut);
     }
 
-    function renderStripCopy() {
-      if (activeLayout !== 'strips' || stripCopyPreview.hidden) return;
+    let isRenderingOffscreen = false;
 
-      const sourceCanvas = imgEditor.canvas;
-      const zoom = sourceCanvas.getZoom();
-      const width = sourceCanvas.getWidth();
-      const height = sourceCanvas.getHeight();
-      stripCopyPreview.style.width = `${width}px`;
-      stripCopyPreview.style.height = `${height}px`;
-
-      if (stripCopyCanvas.getWidth() !== width || stripCopyCanvas.getHeight() !== height) {
-        stripCopyCanvas.setDimensions({ width, height });
-      }
-      stripCopyCanvas.cancelRequestedRender();
-      stripCopyCanvas.viewportTransform = [zoom, 0, 0, zoom, 0, 0];
-      stripCopyCanvas.backgroundColor = sourceCanvas.backgroundColor;
-      stripCopyCanvas.backgroundImage = sourceCanvas.backgroundImage;
+    function withSecondStripTransform(sourceCanvas, callback) {
       const sourceObjects = sourceCanvas.getObjects();
       const objectStates = sourceObjects.map(object => ({
         object,
@@ -641,10 +627,11 @@
             originX: originX === 'left' ? 'right' : (originX === 'right' ? 'left' : originX),
             angle: -(Number(angle) || 0),
             skewX: -(Number(skewX) || 0),
-            ...(isTextObject(object) ? { textAlign: swappedAlign(textAlign) } : {}),
+            ...(isTextObject(object) ? { textAlign: swappedAlign(textAlign), dirty: true } : {}),
           });
+          object.setCoords();
         });
-        stripCopyCanvas.renderCanvas(stripCopyCanvas.contextContainer, sourceObjects);
+        return callback(sourceObjects);
       } finally {
         if (mirrorSecondStrip && backgroundImage) {
           backgroundImage.set('flipX', backgroundFlipX);
@@ -655,10 +642,33 @@
             originX,
             angle,
             skewX,
-            ...(isTextObject(object) ? { textAlign } : {}),
+            ...(isTextObject(object) ? { textAlign, dirty: true } : {}),
           });
+          object.setCoords();
         });
       }
+    }
+
+    function renderStripCopy() {
+      if (isRenderingOffscreen || activeLayout !== 'strips' || stripCopyPreview.hidden) return;
+
+      const sourceCanvas = imgEditor.canvas;
+      const zoom = sourceCanvas.getZoom();
+      const width = sourceCanvas.getWidth();
+      const height = sourceCanvas.getHeight();
+      stripCopyPreview.style.width = `${width}px`;
+      stripCopyPreview.style.height = `${height}px`;
+
+      if (stripCopyCanvas.getWidth() !== width || stripCopyCanvas.getHeight() !== height) {
+        stripCopyCanvas.setDimensions({ width, height });
+      }
+      stripCopyCanvas.cancelRequestedRender();
+      stripCopyCanvas.viewportTransform = [zoom, 0, 0, zoom, 0, 0];
+      stripCopyCanvas.backgroundColor = sourceCanvas.backgroundColor;
+      stripCopyCanvas.backgroundImage = sourceCanvas.backgroundImage;
+      withSecondStripTransform(sourceCanvas, sourceObjects => {
+        stripCopyCanvas.renderCanvas(stripCopyCanvas.contextContainer, sourceObjects);
+      });
       stripCopyCanvas.cancelRequestedRender();
     }
 
@@ -1956,6 +1966,10 @@
       gridBackground: document.querySelector('#download-template-grid-background'),
       stripBackground: document.querySelector('#download-template-strip-background'),
       package: document.querySelector('#download-template-package'),
+      previewsMode: document.querySelector('#template-previews-mode'),
+      previewGallery: document.querySelector('#preview-template-gallery'),
+      downloadPreviews: document.querySelector('#download-template-previews'),
+      previewsStatus: document.querySelector('#template-previews-status'),
       yadiskToken: document.querySelector('#yadisk-template-token'),
       yadiskName: document.querySelector('#yadisk-template-name'),
       yadiskButton: document.querySelector('#export-template-yadisk'),
@@ -2575,7 +2589,7 @@
       };
     }
 
-    function renderCanvasLayer(layer) {
+    function renderCanvasLayer(layer, { secondStrip = false } = {}) {
       const canvas = imgEditor.canvas;
       const profile = activeProfile();
       const layers = activeStaticLayers();
@@ -2585,6 +2599,7 @@
       const backgroundImage = canvas.backgroundImage;
       const backgroundColor = canvas.backgroundColor;
 
+      isRenderingOffscreen = true;
       canvas.getObjects().forEach(object => {
         object.visible = visibleObjects.has(object);
       });
@@ -2594,7 +2609,7 @@
       }
       imgEditor.applyZoom(1);
 
-      try {
+      const render = () => {
         canvas.requestRenderAll();
         return dataURLToBytes(canvas.toDataURL({
           format: 'png',
@@ -2604,6 +2619,10 @@
           width: profile.width,
           height: profile.height,
         }));
+      };
+
+      try {
+        return secondStrip ? withSecondStripTransform(canvas, render) : render();
       } finally {
         canvas.getObjects().forEach((object, index) => {
           object.visible = objectVisibility[index];
@@ -2611,6 +2630,7 @@
         canvas.backgroundImage = backgroundImage;
         canvas.backgroundColor = backgroundColor;
         imgEditor.applyZoom(currentZoom);
+        isRenderingOffscreen = false;
         canvas.requestRenderAll();
       }
     }
@@ -2627,23 +2647,41 @@
       });
     }
 
-    async function stripSheetBytes(sourceBytes) {
-      const bitmap = await createImageBitmap(new Blob([sourceBytes], { type: 'image/png' }));
+    function canvasJPEGBytes(canvas, quality = 0.92) {
+      return new Promise((resolve, reject) => {
+        canvas.toBlob(async blob => {
+          if (!blob) {
+            reject(new Error('Could not render JPEG'));
+            return;
+          }
+          resolve(new Uint8Array(await blob.arrayBuffer()));
+        }, 'image/jpeg', quality);
+      });
+    }
+
+    async function stripSheetBytes(leftBytes, rightBytes = null) {
+      const leftBitmap = await createImageBitmap(new Blob([leftBytes], { type: 'image/png' }));
+      const rightBitmap = rightBytes
+        ? await createImageBitmap(new Blob([rightBytes], { type: 'image/png' }))
+        : null;
       const pair = document.createElement('canvas');
       pair.width = PRINT_HEIGHT;
       pair.height = PRINT_WIDTH;
       const pairContext = pair.getContext('2d');
-      pairContext.drawImage(bitmap, 0, 0);
-      if (mirrorSecondStrip) {
+      pairContext.drawImage(leftBitmap, 0, 0);
+      if (rightBitmap) {
+        pairContext.drawImage(rightBitmap, STRIP_WIDTH, 0);
+      } else if (mirrorSecondStrip) {
         pairContext.save();
         pairContext.translate(PRINT_HEIGHT, 0);
         pairContext.scale(-1, 1);
-        pairContext.drawImage(bitmap, 0, 0);
+        pairContext.drawImage(leftBitmap, 0, 0);
         pairContext.restore();
       } else {
-        pairContext.drawImage(bitmap, STRIP_WIDTH, 0);
+        pairContext.drawImage(leftBitmap, STRIP_WIDTH, 0);
       }
-      bitmap.close?.();
+      leftBitmap.close?.();
+      rightBitmap?.close?.();
 
       const sheet = document.createElement('canvas');
       sheet.width = PRINT_WIDTH;
@@ -2874,6 +2912,16 @@
       exportControls.package.disabled = (
         errors.length > 0 || exportControls.package.classList.contains('busy')
       );
+      if (exportControls.previewGallery) {
+        exportControls.previewGallery.disabled = (
+          errors.length > 0 || exportControls.previewGallery.classList.contains('busy')
+        );
+      }
+      if (exportControls.downloadPreviews) {
+        exportControls.downloadPreviews.disabled = (
+          errors.length > 0 || exportControls.downloadPreviews.classList.contains('busy')
+        );
+      }
     }
 
     async function exportProject(includeImages, explicitName = null) {
@@ -2914,8 +2962,12 @@
             let background = renderCanvasLayer('background');
             let foreground = hasForeground ? renderCanvasLayer('foreground') : null;
             if (layout === 'strips') {
-              background = await stripSheetBytes(background);
-              if (foreground) foreground = await stripSheetBytes(foreground);
+              const secondBackground = renderCanvasLayer('background', { secondStrip: true });
+              background = await stripSheetBytes(background, secondBackground);
+              if (foreground) {
+                const secondForeground = renderCanvasLayer('foreground', { secondStrip: true });
+                foreground = await stripSheetBytes(foreground, secondForeground);
+              }
             }
             images.push({
               name: layout === 'grid' ? 'grid_bg.png' : 'strip_bg.png',
@@ -2961,7 +3013,10 @@
       try {
         if (activeLayout !== layout) await loadLayout(layout);
         let bytes = renderCanvasLayer('background');
-        if (layout === 'strips') bytes = await stripSheetBytes(bytes);
+        if (layout === 'strips') {
+          const secondBytes = renderCanvasLayer('background', { secondStrip: true });
+          bytes = await stripSheetBytes(bytes, secondBytes);
+        }
         downloadBlob(
           new Blob([bytes], { type: 'image/png' }),
           layout === 'grid' ? 'grid_bg.png' : 'strip_bg.png',
@@ -2970,6 +3025,663 @@
         if (activeLayout !== originalLayout) await loadLayout(originalLayout);
         captureActiveLayout();
       }
+    }
+
+    function cropCanvas(source, left, top, width, height) {
+      const out = document.createElement('canvas');
+      out.width = Math.max(1, Math.round(width));
+      out.height = Math.max(1, Math.round(height));
+      const ctx = out.getContext('2d');
+      ctx.drawImage(
+        source,
+        left, top, width, height,
+        0, 0, out.width, out.height,
+      );
+      return out;
+    }
+
+    function rotateCanvasCW(source) {
+      const out = document.createElement('canvas');
+      out.width = source.height;
+      out.height = source.width;
+      const ctx = out.getContext('2d');
+      ctx.translate(out.width, 0);
+      ctx.rotate(Math.PI / 2);
+      ctx.drawImage(source, 0, 0);
+      return out;
+    }
+
+    function rotateCanvasCCW(source, angleDeg) {
+      const padding = 4;
+      const pw = source.width + padding * 2;
+      const ph = source.height + padding * 2;
+      const rad = (-angleDeg * Math.PI) / 180;
+      const cos = Math.abs(Math.cos(rad));
+      const sin = Math.abs(Math.sin(rad));
+      const out = document.createElement('canvas');
+      out.width = Math.ceil(pw * cos + ph * sin);
+      out.height = Math.ceil(pw * sin + ph * cos);
+      const ctx = out.getContext('2d');
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.translate(out.width / 2, out.height / 2);
+      ctx.rotate(rad);
+      ctx.drawImage(source, -source.width / 2, -source.height / 2);
+      return out;
+    }
+
+    function resizeCanvas(source, { width = null, height = null } = {}) {
+      let targetW = width;
+      let targetH = height;
+      if (targetW === null && targetH === null) return source;
+      if (targetW === null) {
+        targetW = Math.max(1, Math.round((source.width * targetH) / source.height));
+      } else if (targetH === null) {
+        targetH = Math.max(1, Math.round((source.height * targetW) / source.width));
+      } else {
+        targetW = Math.max(1, Math.round(targetW));
+        targetH = Math.max(1, Math.round(targetH));
+      }
+
+      let current = source;
+      while (current.width * 0.5 >= targetW && current.height * 0.5 >= targetH) {
+        const step = document.createElement('canvas');
+        step.width = Math.max(targetW, Math.round(current.width * 0.5));
+        step.height = Math.max(targetH, Math.round(current.height * 0.5));
+        const stepCtx = step.getContext('2d');
+        stepCtx.imageSmoothingEnabled = true;
+        stepCtx.imageSmoothingQuality = 'high';
+        stepCtx.drawImage(current, 0, 0, step.width, step.height);
+        current = step;
+      }
+
+      const out = document.createElement('canvas');
+      out.width = targetW;
+      out.height = targetH;
+      const ctx = out.getContext('2d');
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(current, 0, 0, targetW, targetH);
+      return out;
+    }
+
+    function trimTransparentBounds(canvas) {
+      const ctx = canvas.getContext('2d');
+      const { width, height } = canvas;
+      const data = ctx.getImageData(0, 0, width, height).data;
+      let top = height, left = width, right = -1, bottom = -1;
+      for (let y = 0; y < height; y += 1) {
+        const rowOffset = y * width * 4;
+        for (let x = 0; x < width; x += 1) {
+          if (data[rowOffset + x * 4 + 3] > 0) {
+            if (x < left) left = x;
+            if (x > right) right = x;
+            if (y < top) top = y;
+            if (y > bottom) bottom = y;
+          }
+        }
+      }
+      if (right < left || bottom < top) return canvas;
+      const trimmedWidth = right - left + 1;
+      const trimmedHeight = bottom - top + 1;
+      const trimmed = document.createElement('canvas');
+      trimmed.width = trimmedWidth;
+      trimmed.height = trimmedHeight;
+      trimmed.getContext('2d').drawImage(
+        canvas,
+        left, top, trimmedWidth, trimmedHeight,
+        0, 0, trimmedWidth, trimmedHeight,
+      );
+      return trimmed;
+    }
+
+    function buildShadowBlock(prints) {
+      const width = Math.max(...prints.map(([img, [x]]) => x + img.width));
+      const height = Math.max(...prints.map(([img, [, y]]) => y + img.height));
+      const blur = 60;
+      const slack = blur * 3;
+      const layer = document.createElement('canvas');
+      layer.width = width + slack * 2;
+      layer.height = height + slack * 2;
+      const ctx = layer.getContext('2d');
+
+      prints.forEach(([img, [x, y]]) => {
+        ctx.save();
+        ctx.shadowColor = 'rgba(0, 0, 0, 0.745)';
+        ctx.shadowBlur = blur * 1.6;
+        ctx.shadowOffsetX = 24;
+        ctx.shadowOffsetY = 44;
+        ctx.drawImage(img, x + slack, y + slack);
+        ctx.restore();
+      });
+
+      return trimTransparentBounds(layer);
+    }
+
+    function buildLabeledBlock(block, caption) {
+      const captionSize = Math.round(2200 * 0.042);
+      const captionGap = 78;
+      const fontSpec = `700 ${captionSize}px "Comfortaa", sans-serif`;
+      const probe = document.createElement('canvas').getContext('2d');
+      probe.font = fontSpec;
+      const metrics = probe.measureText(caption);
+      const textWidth = Math.ceil(metrics.width);
+      const ascent = Math.ceil(metrics.actualBoundingBoxAscent || captionSize * 0.78);
+      const descent = Math.ceil(metrics.actualBoundingBoxDescent || captionSize * 0.22);
+      const textHeight = ascent + descent;
+
+      const width = Math.max(block.width, textWidth);
+      const height = block.height + captionGap + textHeight;
+      const out = document.createElement('canvas');
+      out.width = width;
+      out.height = height;
+      const ctx = out.getContext('2d');
+      ctx.drawImage(block, Math.floor((width - block.width) / 2), 0);
+      ctx.font = fontSpec;
+      ctx.fillStyle = 'rgb(240, 238, 234)';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillText(caption, Math.floor(width / 2), block.height + captionGap + ascent);
+      return out;
+    }
+
+    function composeCollageLayout(placed) {
+      const margin = 210;
+      const width = Math.max(...placed.map(([block, [x]]) => x + block.width)) + margin * 2;
+      const height = Math.max(...placed.map(([block, [, y]]) => y + block.height)) + margin * 2;
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+
+      const bgGrad = ctx.createLinearGradient(0, 0, 0, height);
+      bgGrad.addColorStop(0, 'rgb(88, 86, 82)');
+      bgGrad.addColorStop(1, 'rgb(54, 53, 50)');
+      ctx.fillStyle = bgGrad;
+      ctx.fillRect(0, 0, width, height);
+
+      ctx.save();
+      ctx.translate(width / 2, height / 2);
+      ctx.scale(width / 2, height / 2);
+      const vignette = ctx.createRadialGradient(0, 0, 0.92, 0, 0, 1.58);
+      vignette.addColorStop(0, 'rgba(0, 0, 0, 0)');
+      vignette.addColorStop(1, 'rgba(0, 0, 0, 0.373)');
+      ctx.fillStyle = vignette;
+      ctx.fillRect(-1, -1, 2, 2);
+      ctx.restore();
+
+      placed.forEach(([block, [x, y]]) => {
+        ctx.drawImage(block, x + margin, y + margin);
+      });
+
+      const maxEdge = Math.max(width, height);
+      const targetEdge = 2400;
+      if (targetEdge < maxEdge) {
+        const scale = targetEdge / maxEdge;
+        return resizeCanvas(canvas, {
+          width: Math.max(1, Math.round(width * scale)),
+          height: Math.max(1, Math.round(height * scale)),
+        });
+      }
+      return canvas;
+    }
+
+    function composeStripSheetCanvas(leftCanvas, rightCanvas) {
+      const pair = document.createElement('canvas');
+      pair.width = PRINT_HEIGHT;
+      pair.height = PRINT_WIDTH;
+      const pairContext = pair.getContext('2d');
+      pairContext.drawImage(leftCanvas, 0, 0);
+      pairContext.drawImage(rightCanvas, STRIP_WIDTH, 0);
+
+      const sheet = document.createElement('canvas');
+      sheet.width = PRINT_WIDTH;
+      sheet.height = PRINT_HEIGHT;
+      const sheetContext = sheet.getContext('2d');
+      sheetContext.translate(0, PRINT_HEIGHT);
+      sheetContext.rotate(-Math.PI / 2);
+      sheetContext.drawImage(pair, 0, 0);
+      return sheet;
+    }
+
+    function renderPreviewSheetElement({ showNumbers = true, single = false, secondStrip = false } = {}) {
+      const canvas = imgEditor.canvas;
+      const profile = activeProfile();
+      const currentZoom = canvas.getZoom();
+      const activeObject = canvas.getActiveObject();
+      const objects = canvas.getObjects();
+      const objectVisibility = objects.map(object => object.visible);
+      const slots = objects
+        .filter(object => object.kind === 'photo-slot')
+        .sort((a, b) => a.photoIndex - b.photoIndex);
+
+      const slotStates = slots.map(slot => ({
+        slot,
+        left: slot.left,
+        top: slot.top,
+        scaleX: slot.scaleX,
+        scaleY: slot.scaleY,
+        children: slot.getObjects().map(child => ({
+          child,
+          visible: child.visible,
+          left: child.left,
+          top: child.top,
+          scaleX: child.scaleX,
+          scaleY: child.scaleY,
+        })),
+      }));
+
+      isRenderingOffscreen = true;
+      if (activeObject) canvas.discardActiveObject();
+
+      objects.forEach(object => {
+        if (object.excludeFromExport) object.visible = false;
+      });
+
+      if (single) {
+        const singleSlot = PHOTO_LAYOUT.presets.find(preset => preset.id === 'single').slots[0];
+        slots.forEach((slot, index) => {
+          slot.visible = index === 0;
+        });
+        if (slots[0]) {
+          const slot = slots[0];
+          const scaleX = singleSlot.width / slot.width;
+          const scaleY = singleSlot.height / slot.height;
+          slot.set({
+            left: singleSlot.x,
+            top: singleSlot.y,
+            scaleX,
+            scaleY,
+          });
+          const children = slot.getObjects();
+          const previewImg = children.find(c => c.kind === 'photo-preview-image');
+          const numberObj = children.find(c => c.kind === 'photo-slot-number');
+          const badgeObj = children.find(c => c.kind === 'photo-slot-badge');
+          if (previewImg) {
+            const imageScale = Math.min(singleSlot.width / previewImg.width, singleSlot.height / previewImg.height);
+            previewImg.set({
+              scaleX: imageScale / scaleX,
+              scaleY: imageScale / scaleY,
+            });
+            const radius = Math.max(18, Math.min(56, singleSlot.width / 8, singleSlot.height / 8));
+            const badgeX = (-singleSlot.width / 2) + radius + 18;
+            const badgeY = (-singleSlot.height / 2) + radius + 18;
+            badgeObj?.set({
+              left: badgeX / scaleX,
+              top: badgeY / scaleY,
+              scaleX: radius / badgeObj.radius / scaleX,
+              scaleY: radius / badgeObj.radius / scaleY,
+            });
+            numberObj?.set({
+              left: badgeX / scaleX,
+              top: badgeY / scaleY,
+              scaleX: (radius * 1.25) / numberObj.fontSize / scaleX,
+              scaleY: (radius * 1.25) / numberObj.fontSize / scaleY,
+            });
+          } else if (numberObj) {
+            const fontSize = Math.max(40, Math.min(singleSlot.width, singleSlot.height) * 0.24);
+            numberObj.set({
+              scaleX: fontSize / numberObj.fontSize / scaleX,
+              scaleY: fontSize / numberObj.fontSize / scaleY,
+            });
+          }
+          slot.setCoords();
+        }
+      } else {
+        slots.forEach(slot => {
+          slot.visible = true;
+        });
+      }
+
+      slots.forEach(slot => {
+        if (!slot.visible) return;
+        slot.getObjects().forEach(child => {
+          if (child.kind === 'photo-slot-number' || child.kind === 'photo-slot-badge') {
+            child.visible = showNumbers;
+          }
+        });
+        slot.dirty = true;
+      });
+
+      imgEditor.applyZoom(1);
+
+      const render = () => {
+        canvas.requestRenderAll();
+        return canvas.toCanvasElement(1, {
+          left: 0,
+          top: 0,
+          width: profile.width,
+          height: profile.height,
+        });
+      };
+
+      try {
+        return secondStrip ? withSecondStripTransform(canvas, render) : render();
+      } finally {
+        slotStates.forEach(({ slot, left, top, scaleX, scaleY, children }) => {
+          slot.set({ left, top, scaleX, scaleY });
+          children.forEach(({ child, visible, left: cL, top: cT, scaleX: cSX, scaleY: cSY }) => {
+            child.set({ visible, left: cL, top: cT, scaleX: cSX, scaleY: cSY });
+          });
+          slot.dirty = true;
+          slot.setCoords();
+        });
+        canvas.getObjects().forEach((object, index) => {
+          object.visible = objectVisibility[index];
+        });
+        imgEditor.applyZoom(currentZoom);
+        isRenderingOffscreen = false;
+        canvas.requestRenderAll();
+      }
+    }
+
+    async function generateVariantPreviews(showNumbers) {
+      const originalLayout = activeLayout;
+      captureActiveLayout();
+      try {
+        if (activeLayout !== 'grid') await loadLayout('grid');
+        await ensureOnlineFontAssets();
+        const gridSheet = renderPreviewSheetElement({ showNumbers, single: false });
+        const singleSheet = renderPreviewSheetElement({ showNumbers, single: true });
+
+        if (activeLayout !== 'strips') await loadLayout('strips');
+        await ensureOnlineFontAssets();
+        const stripLeft = renderPreviewSheetElement({ showNumbers, secondStrip: false });
+        const stripRight = renderPreviewSheetElement({ showNumbers, secondStrip: true });
+        const stripsSheet = composeStripSheetCanvas(stripLeft, stripRight);
+
+        const trim = printTrimConfig();
+        const trimW = PRINT_WIDTH - trim.left - trim.right;
+        const trimH = PRINT_HEIGHT - trim.top - trim.bottom;
+
+        const paperGrid = cropCanvas(gridSheet, trim.left, trim.top, trimW, trimH);
+        const paperSingle = cropCanvas(singleSheet, trim.left, trim.top, trimW, trimH);
+
+        const stripsTrimmed = cropCanvas(stripsSheet, trim.left, trim.top, trimW, trimH);
+        const halfH = Math.floor(stripsTrimmed.height / 2);
+        const paperCut01 = rotateCanvasCW(cropCanvas(stripsTrimmed, 0, 0, stripsTrimmed.width, halfH));
+        const paperCut02 = rotateCanvasCW(cropCanvas(stripsTrimmed, 0, halfH, stripsTrimmed.width, stripsTrimmed.height - halfH));
+
+        // Format collages
+        const postcard = resizeCanvas(paperGrid, { width: 2200 });
+        const single = resizeCanvas(paperSingle, { width: 2200 });
+        const stripBack = resizeCanvas(paperCut01, { height: 2200 });
+        const stripFront = resizeCanvas(paperCut02, { height: 2200 });
+
+        const rotPostcard = rotateCanvasCCW(postcard, 2.0);
+        const rotSingle = rotateCanvasCCW(single, -1.6);
+        const rotStripBack = rotateCanvasCCW(stripBack, 9.0);
+        const rotStripFront = rotateCanvasCCW(stripFront, -3.5);
+        const fanStep = Math.round(stripFront.width * (1 - 0.26));
+
+        const blockPostcard = buildShadowBlock([[rotPostcard, [0, 0]]]);
+        const blockSingle = buildShadowBlock([[rotSingle, [0, 0]]]);
+        const blockStrips = buildShadowBlock([[rotStripBack, [0, 0]], [rotStripFront, [fanStep, 0]]]);
+
+        const labeledPostcard = buildLabeledBlock(blockPostcard, 'ОТКРЫТКА');
+        const labeledSingle = buildLabeledBlock(blockSingle, 'ОДНО ФОТО');
+        const labeledStrips = buildLabeledBlock(blockStrips, 'ДВЕ ПОЛОСКИ');
+
+        const gap = 150;
+        const mosaicLeftW = Math.max(labeledPostcard.width, labeledSingle.width);
+        const mosaicLeftH = labeledPostcard.height + gap + labeledSingle.height;
+        const collageMosaic = composeCollageLayout([
+          [labeledPostcard, [Math.floor((mosaicLeftW - labeledPostcard.width) / 2), 0]],
+          [labeledSingle, [Math.floor((mosaicLeftW - labeledSingle.width) / 2), labeledPostcard.height + gap]],
+          [labeledStrips, [mosaicLeftW + gap, Math.max(0, Math.floor((mosaicLeftH - labeledStrips.height) / 2))]],
+        ]);
+
+        const rowH = Math.max(labeledPostcard.height, labeledSingle.height, labeledStrips.height);
+        const collageRow = composeCollageLayout([
+          [labeledPostcard, [0, rowH - labeledPostcard.height]],
+          [labeledSingle, [labeledPostcard.width + gap, rowH - labeledSingle.height]],
+          [labeledStrips, [labeledPostcard.width + gap + labeledSingle.width + gap, rowH - labeledStrips.height]],
+        ]);
+
+        const colW = Math.max(labeledPostcard.width, labeledSingle.width, labeledStrips.width);
+        const collageColumn = composeCollageLayout([
+          [labeledPostcard, [Math.floor((colW - labeledPostcard.width) / 2), 0]],
+          [labeledSingle, [Math.floor((colW - labeledSingle.width) / 2), labeledPostcard.height + gap]],
+          [labeledStrips, [Math.floor((colW - labeledStrips.width) / 2), labeledPostcard.height + gap + labeledSingle.height + gap]],
+        ]);
+
+        const webGrid = resizeCanvas(paperGrid, { width: 2048 });
+        const webSingle = resizeCanvas(paperSingle, { width: 2048 });
+        const webCut01 = resizeCanvas(paperCut01, { height: 2048 });
+        const webCut02 = resizeCanvas(paperCut02, { height: 2048 });
+
+        return {
+          sheets: { gridSheet, singleSheet, stripsSheet },
+          collages: { mosaic: collageMosaic, row: collageRow, column: collageColumn },
+          formats: {
+            grid: webGrid,
+            single: webSingle,
+            stripsCut01: webCut01,
+            stripsCut02: webCut02,
+          },
+        };
+      } finally {
+        if (activeLayout !== originalLayout) await loadLayout(originalLayout);
+        captureActiveLayout();
+      }
+    }
+
+    async function buildPreviewsData(mode) {
+      const gridError = layoutReadiness('grid');
+      const stripsError = layoutReadiness('strips');
+      if (gridError || stripsError) {
+        throw new Error(gridError ? `Grid: ${gridError}` : `Strips: ${stripsError}`);
+      }
+
+      const results = {};
+      if (mode === 'both') {
+        results.numbered = await generateVariantPreviews(true);
+        results.plain = await generateVariantPreviews(false);
+      } else if (mode === 'plain') {
+        results.plain = await generateVariantPreviews(false);
+      } else {
+        results.numbered = await generateVariantPreviews(true);
+      }
+      return results;
+    }
+
+    async function buildPreviewsZipFiles(packName, mode, previewsData) {
+      const files = [];
+
+      async function addVariantFiles(variantData, prefix = '') {
+        const { collages, formats, sheets } = variantData;
+        const add = async (canvas, path) => {
+          const data = await canvasJPEGBytes(canvas, 0.92);
+          files.push({ name: `${prefix}${path}`, data });
+        };
+
+        await add(collages.mosaic, `formats_${packName}_mosaic.jpg`);
+        await add(collages.row, `formats_${packName}_row.jpg`);
+        await add(collages.column, `formats_${packName}_column.jpg`);
+        await add(formats.grid, 'grid.jpg');
+        await add(formats.single, 'single_01_frame.jpg');
+        await add(formats.stripsCut01, 'strips_cut_01.jpg');
+        await add(formats.stripsCut02, 'strips_cut_02.jpg');
+        await add(sheets.gridSheet, 'print/grid.jpg');
+        await add(sheets.singleSheet, 'print/single_01_frame.jpg');
+        await add(sheets.stripsSheet, 'print/strips.jpg');
+      }
+
+      if (mode === 'both') {
+        await addVariantFiles(previewsData.numbered, 'numbered/');
+        await addVariantFiles(previewsData.plain, 'plain/');
+      } else if (mode === 'plain') {
+        await addVariantFiles(previewsData.plain, '');
+      } else {
+        await addVariantFiles(previewsData.numbered, '');
+      }
+
+      return files;
+    }
+
+    function setPreviewsStatus(message = '', type = '') {
+      if (!exportControls.previewsStatus) return;
+      exportControls.previewsStatus.hidden = !message;
+      exportControls.previewsStatus.textContent = message;
+      exportControls.previewsStatus.className = `template-import-status ${type}`.trim();
+    }
+
+    async function openPreviewsModal(previewsData, packName, mode) {
+      document.querySelector('.template-previews-modal')?.remove();
+
+      let activeVariant = previewsData.numbered ? 'numbered' : 'plain';
+      const hasBoth = Boolean(previewsData.numbered && previewsData.plain);
+
+      const modal = document.createElement('div');
+      modal.className = 'custom-modal-container template-previews-modal';
+      modal.setAttribute('role', 'dialog');
+      modal.setAttribute('aria-modal', 'true');
+
+      modal.innerHTML = `
+        <div class="custom-modal-content template-previews-content">
+          <div class="template-previews-header">
+            <div class="template-previews-title-group">
+              <span class="studio-brand-mark">TS</span>
+              <div>
+                <h3>${translate(`Превью шаблона «${packName}»`, `Previews for “${packName}”`)}</h3>
+                <p>${translate('Печатные форматы и промо-коллажи для соцсетей', 'Print formats and promotional collages')}</p>
+              </div>
+            </div>
+            <div class="template-previews-header-actions">
+              ${hasBoth ? `
+                <div class="preview-variant-tabs" role="tablist">
+                  <button type="button" class="active" data-preview-tab="numbered">${translate('С номерами (1–4)', 'Numbered (1–4)')}</button>
+                  <button type="button" data-preview-tab="plain">${translate('Чистые (без цифр)', 'Plain (no numbers)')}</button>
+                </div>
+              ` : ''}
+              <button type="button" class="primary" id="modal-download-previews-zip">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                <span>${translate('Скачать ZIP', 'Download ZIP')}</span>
+              </button>
+              <button type="button" class="template-previews-close" aria-label="${translate('Закрыть', 'Close')}">✕</button>
+            </div>
+          </div>
+          <div class="template-previews-body"></div>
+        </div>
+      `;
+
+      const body = modal.querySelector('.template-previews-body');
+      const closeBtn = modal.querySelector('.template-previews-close');
+      const downloadZipBtn = modal.querySelector('#modal-download-previews-zip');
+      const tabs = modal.querySelectorAll('[data-preview-tab]');
+      const activeObjectUrls = [];
+
+      function cleanupUrls() {
+        activeObjectUrls.forEach(url => URL.revokeObjectURL(url));
+        activeObjectUrls.length = 0;
+      }
+
+      function downloadCanvas(canvas, filename) {
+        canvas.toBlob(blob => {
+          if (!blob) return;
+          downloadBlob(blob, filename);
+        }, 'image/jpeg', 0.95);
+      }
+
+      function renderItems(variantKey) {
+        cleanupUrls();
+        body.innerHTML = '';
+        const data = previewsData[variantKey];
+        if (!data) return;
+
+        function makeCard(canvas, label, filename) {
+          const card = document.createElement('div');
+          card.className = 'template-preview-card';
+          const url = canvas.toDataURL('image/jpeg', 0.85);
+
+          card.innerHTML = `
+            <div class="template-preview-thumb">
+              <img src="${url}" alt="${label}" loading="lazy">
+            </div>
+            <div class="template-preview-info">
+              <div>
+                <strong>${label}</strong>
+                <small>${canvas.width} × ${canvas.height} px · ${filename}</small>
+              </div>
+              <button type="button" class="template-preview-download" title="${translate('Скачать изображение', 'Download image')}">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+              </button>
+            </div>
+          `;
+
+          card.querySelector('.template-preview-thumb').addEventListener('click', () => {
+            downloadCanvas(canvas, filename);
+          });
+          card.querySelector('.template-preview-download').addEventListener('click', e => {
+            e.stopPropagation();
+            downloadCanvas(canvas, filename);
+          });
+          return card;
+        }
+
+        const collagesSection = document.createElement('div');
+        collagesSection.className = 'template-previews-section-block';
+        collagesSection.innerHTML = `<h4>${translate('Коллажи форматов', 'Format collages')}</h4>`;
+        const collagesGrid = document.createElement('div');
+        collagesGrid.className = 'template-previews-cards-grid';
+        collagesGrid.append(
+          makeCard(data.collages.mosaic, translate('Мозаика', 'Mosaic'), `formats_${packName}_mosaic.jpg`),
+          makeCard(data.collages.row, translate('В ряд', 'Row'), `formats_${packName}_row.jpg`),
+          makeCard(data.collages.column, translate('В колонку', 'Column'), `formats_${packName}_column.jpg`),
+        );
+        collagesSection.appendChild(collagesGrid);
+
+        const formatsSection = document.createElement('div');
+        formatsSection.className = 'template-previews-section-block';
+        formatsSection.innerHTML = `<h4>${translate('Печатные форматы (обрезка и разрез)', 'Print formats (trimmed & cut)')}</h4>`;
+        const formatsGrid = document.createElement('div');
+        formatsGrid.className = 'template-previews-cards-grid';
+        formatsGrid.append(
+          makeCard(data.formats.grid, translate('Открытка 2×2', 'Postcard 2×2'), 'grid.jpg'),
+          makeCard(data.formats.single, translate('Одно фото', 'Single photo'), 'single_01_frame.jpg'),
+          makeCard(data.formats.stripsCut02, translate('Полоска 1 (основная)', 'Strip 1 (primary)'), 'strips_cut_02.jpg'),
+          makeCard(data.formats.stripsCut01, translate('Полоска 2 (вторая)', 'Strip 2 (second)'), 'strips_cut_01.jpg'),
+        );
+        formatsSection.appendChild(formatsGrid);
+
+        body.append(collagesSection, formatsSection);
+      }
+
+      tabs.forEach(tab => {
+        tab.addEventListener('click', () => {
+          tabs.forEach(t => t.classList.remove('active'));
+          tab.classList.add('active');
+          activeVariant = tab.dataset.previewTab;
+          renderItems(activeVariant);
+        });
+      });
+
+      downloadZipBtn.addEventListener('click', async () => {
+        downloadZipBtn.disabled = true;
+        try {
+          const files = await buildPreviewsZipFiles(packName, mode, previewsData);
+          downloadBlob(zipFiles(files), `${packName}_previews.zip`);
+          imgEditor.toast(translate('ZIP с превью скачан', 'Previews ZIP downloaded'), 'Success');
+        } catch (err) {
+          console.error('[template-studio] preview zip error', err);
+          imgEditor.toast(err.message, 'Danger');
+        } finally {
+          downloadZipBtn.disabled = false;
+        }
+      });
+
+      function closeModal() {
+        cleanupUrls();
+        modal.remove();
+      }
+
+      closeBtn.addEventListener('click', closeModal);
+      modal.addEventListener('click', e => {
+        if (e.target === modal) closeModal();
+      });
+
+      document.body.appendChild(modal);
+      renderItems(activeVariant);
     }
 
     function fontAssetForObject(object) {
@@ -3716,6 +4428,63 @@
         renderExportSummary();
       }
     });
+
+    if (exportControls.previewGallery) {
+      exportControls.previewGallery.addEventListener('click', async () => {
+        exportControls.previewGallery.classList.add('busy');
+        exportControls.previewGallery.disabled = true;
+        setLayoutTabsDisabled(true);
+        setPreviewsStatus(translate('Генерирую превью…', 'Generating previews…'));
+
+        try {
+          const packName = exportSettings().name;
+          const mode = exportControls.previewsMode?.value || 'both';
+          const previewsData = await buildPreviewsData(mode);
+          setPreviewsStatus();
+          await openPreviewsModal(previewsData, packName, mode);
+        } catch (error) {
+          console.error('[template-studio] previews error', error);
+          setPreviewsStatus(error.message, 'error');
+          imgEditor.toast(error.message, 'Danger', 4000);
+        } finally {
+          exportControls.previewGallery.classList.remove('busy');
+          exportControls.previewGallery.disabled = false;
+          setLayoutTabsDisabled(false);
+          renderExportSummary();
+        }
+      });
+    }
+
+    if (exportControls.downloadPreviews) {
+      exportControls.downloadPreviews.addEventListener('click', async () => {
+        exportControls.downloadPreviews.classList.add('busy');
+        exportControls.downloadPreviews.disabled = true;
+        setLayoutTabsDisabled(true);
+        setPreviewsStatus(translate('Создаю архив превью…', 'Building previews archive…'));
+
+        try {
+          const packName = exportSettings().name;
+          const mode = exportControls.previewsMode?.value || 'both';
+          const previewsData = await buildPreviewsData(mode);
+          const files = await buildPreviewsZipFiles(packName, mode, previewsData);
+          downloadBlob(zipFiles(files), `${packName}_previews.zip`);
+          setPreviewsStatus(translate('Архив превью готов', 'Previews archive ready'), 'success');
+          imgEditor.toast(
+            translate('ZIP с превью готов', 'Previews ZIP is ready'),
+            'Success',
+          );
+        } catch (error) {
+          console.error('[template-studio] previews zip error', error);
+          setPreviewsStatus(error.message, 'error');
+          imgEditor.toast(error.message, 'Danger', 4000);
+        } finally {
+          exportControls.downloadPreviews.classList.remove('busy');
+          exportControls.downloadPreviews.disabled = false;
+          setLayoutTabsDisabled(false);
+          renderExportSummary();
+        }
+      });
+    }
 
     exportControls.yadiskButton.addEventListener('click', async () => {
       const token = exportControls.yadiskToken.value.trim();
