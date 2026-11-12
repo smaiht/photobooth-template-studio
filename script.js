@@ -623,7 +623,7 @@
         }
         objectStates.forEach(({ object, left, originX, angle, skewX, textAlign }) => {
           object.set({
-            left: sourceCanvas.originalW - (Number(left) || 0),
+            left: sourceCanvas.originalW - (Number(left) || 0) + imgEditor.getSecondStripOffsetX(),
             originX: originX === 'left' ? 'right' : (originX === 'right' ? 'left' : originX),
             angle: -(Number(angle) || 0),
             skewX: -(Number(skewX) || 0),
@@ -1267,6 +1267,7 @@
       const isGrid = layout === 'grid';
 
       canvas.setZoom(1);
+      canvas.secondStripOffsetHistoryEnabled = !isGrid;
       canvas.originalW = profile.width;
       canvas.originalH = profile.height;
       canvas.setDimensions({ width: profile.width, height: profile.height });
@@ -1507,6 +1508,7 @@
         projectTrim = { ...PRINT_TRIM };
         projectName = 'template';
         mirrorSecondStrip = true;
+        imgEditor.setSecondStripOffsetX(0, { validate: false, notify: false });
         pendingBackgroundLayout = null;
         Object.assign(layoutLabels, DEFAULT_LAYOUT_LABELS);
         Object.keys(layoutDocuments).forEach(layout => {
@@ -1614,6 +1616,7 @@
         activeLayout,
         projectName,
         mirrorSecondStrip,
+        secondStripOffsetX: imgEditor.getSecondStripOffsetX(),
         printTrim: projectTrim,
         layoutLabels: { ...layoutLabels },
         layouts: {
@@ -1688,6 +1691,10 @@
 
       await restoreFontAssets(draft.fonts);
       mirrorSecondStrip = draft.mirrorSecondStrip !== false;
+      imgEditor.setSecondStripOffsetX(
+        Number.isInteger(draft.secondStripOffsetX) ? draft.secondStripOffsetX : 0,
+        { validate: false, notify: false },
+      );
       projectTrim = { ...PRINT_TRIM, ...draft.printTrim };
       projectName = typeof draft.projectName === 'string' && draft.projectName
         ? draft.projectName
@@ -2377,6 +2384,33 @@
         }))
         .filter(block => block.position.x >= 0 && block.position.x <= STRIP_WIDTH);
 
+      // Older templates may not have editor metadata. Recover a shared offset
+      // from the two sets of photo coordinates when they match consistently.
+      const copyOffsets = leftPhotos.map(photo => {
+        const copy = layout.photos.find(item => {
+          const width = item.width ?? defaultSize.width;
+          const height = item.height ?? defaultSize.height;
+          return item.photo_index === photo.photo_index
+            && item.y >= 0 && item.y + height <= STRIP_WIDTH
+            && item.x === photo.y
+            && width === photo.height && height === photo.width;
+        });
+        return copy ? photo.x - copy.y : null;
+      });
+      const inferredOffset = copyOffsets.every(offset => (
+        Number.isInteger(offset) && offset === copyOffsets[0]
+      )) ? copyOffsets[0] : 0;
+      const savedOffset = config._studio?.layouts?.strips?.second_strip_offset_x;
+      const secondStripOffsetX = savedOffset === undefined ? inferredOffset : savedOffset;
+      const offsetRange = imgEditor.getSecondStripOffsetRange(leftPhotos, STRIP_WIDTH);
+      if (!Number.isInteger(secondStripOffsetX)
+        || secondStripOffsetX < offsetRange.min || secondStripOffsetX > offsetRange.max) {
+        throw templateImportError(
+          'Некорректное смещение второй полоски: фото выходит за её край',
+          'The second strip offset is invalid: a photo extends beyond its edge',
+        );
+      }
+
       return {
         key,
         label: typeof template.label === 'string' && template.label.trim()
@@ -2387,6 +2421,7 @@
         background: layout.background,
         foreground: layout.foreground || null,
         mirrorSecondStrip: template.mirror_second_strip !== false,
+        secondStripOffsetX,
       };
     }
 
@@ -2770,6 +2805,13 @@
     }
 
     function stripTextCopies(block) {
+      const secondY = block.position.x - imgEditor.getSecondStripOffsetX();
+      if (secondY < 0 || secondY > STRIP_WIDTH) {
+        throw new Error(translate(
+          'Якорь подписи выходит за край второй полоски. Уменьшите её смещение.',
+          'A text anchor is outside the second strip. Reduce its offset.',
+        ));
+      }
       const left = {
         ...block,
         position: {
@@ -2782,7 +2824,7 @@
         ...block,
         position: {
           x: block.position.y,
-          y: block.position.x,
+          y: secondY,
         },
         align: swappedAlign(block.align),
         angle: normalizedAngle(-block.angle - 90),
@@ -2799,6 +2841,14 @@
       if (!photos.length) {
         throw new Error(translate('Добавьте фото на левую полосу', 'Add photos to the left strip'));
       }
+      const offset = imgEditor.getSecondStripOffsetX();
+      const offsetRange = imgEditor.getSecondStripOffsetRange(photos, STRIP_WIDTH);
+      if (offset < offsetRange.min || offset > offsetRange.max) {
+        throw new Error(translate(
+          'Фото выходит за край второй полоски. Измените её смещение.',
+          'A photo extends beyond the second strip. Adjust its offset.',
+        ));
+      }
 
       const textCopies = activeTextBlocks(usedFonts).map(stripTextCopies);
       const textBlocks = [
@@ -2808,7 +2858,7 @@
       const rightPhotos = photos.map(photo => ({
         photo_index: photo.photo_index,
         x: Math.round(photo.y),
-        y: Math.round(photo.x),
+        y: Math.round(photo.x - offset),
         width: Math.round(photo.height),
         height: Math.round(photo.width),
         rotate: 'ccw',
@@ -2862,8 +2912,23 @@
         return translate('нет фона', 'no background');
       }
       const objects = documentState.canvas.objects || [];
-      if (!objects.some(object => object.kind === 'photo-slot')) {
+      const slots = objects.filter(object => object.kind === 'photo-slot');
+      if (!slots.length) {
         return translate('нет фотослотов', 'no photo slots');
+      }
+      if (layout === 'strips') {
+        const geometries = slots.map(slot => ({
+          x: Math.round(slot.left),
+          width: Math.max(40, Math.round(Math.abs(slot.width * (slot.scaleX || 1)))),
+        }));
+        const range = imgEditor.getSecondStripOffsetRange(geometries, STRIP_WIDTH);
+        const offset = imgEditor.getSecondStripOffsetX();
+        if (offset < range.min || offset > range.max) {
+          return translate(
+            'фото выходит за край второй полоски',
+            'a photo extends beyond the second strip',
+          );
+        }
       }
       const missingFont = objects.find(object => (
         object.type === 'i-text'
@@ -2953,6 +3018,9 @@
               after_photos: staticLayers.foreground.map(studioObjectJSON),
             },
           };
+          if (layout === 'strips') {
+            studioLayouts[layout].second_strip_offset_x = imgEditor.getSecondStripOffsetX();
+          }
           templates[layout] = layout === 'grid'
             ? gridTemplate(usedFonts, hasForeground)
             : stripsTemplate(usedFonts, hasForeground);
@@ -4012,6 +4080,7 @@
     async function applyImportedLayout(definition, images, fonts, studioLayout = null) {
       const canvas = imgEditor.canvas;
       const previousHistoryProcessing = canvas.historyProcessing;
+      let beforePhotoObjects = [];
       canvas.historyProcessing = true;
       try {
         layoutDocuments[definition.key] = null;
@@ -4042,8 +4111,8 @@
         }
 
         if (studioLayout) {
-          const objects = await enlivenStudioObjects(studioLayout.layers.before_photos);
-          canvas.add(...objects);
+          beforePhotoObjects = await enlivenStudioObjects(studioLayout.layers.before_photos);
+          canvas.add(...beforePhotoObjects);
         }
 
         if (!imgEditor.setPhotoLayoutState({
@@ -4055,6 +4124,9 @@
             'Could not restore photo slots',
           );
         }
+        // Creating the first photo layer otherwise places it before any
+        // existing objects; restore the exported layer order explicitly.
+        beforePhotoObjects.forEach((object, index) => canvas.moveTo(object, index));
 
         if (studioLayout) {
           const objects = await enlivenStudioObjects(studioLayout.layers.after_photos);
@@ -4100,6 +4172,7 @@
         activeLayout,
         projectName,
         mirrorSecondStrip,
+        secondStripOffsetX: imgEditor.getSecondStripOffsetX(),
         projectTrim: { ...projectTrim },
         layoutLabels: { ...layoutLabels },
         layouts: clone(layoutDocuments),
@@ -4110,6 +4183,10 @@
     async function restoreProjectSnapshot(snapshot) {
       projectName = snapshot.projectName;
       mirrorSecondStrip = snapshot.mirrorSecondStrip;
+      imgEditor.setSecondStripOffsetX(snapshot.secondStripOffsetX, {
+        validate: false,
+        notify: false,
+      });
       projectTrim = { ...snapshot.projectTrim };
       Object.assign(layoutLabels, snapshot.layoutLabels);
       Object.keys(layoutDocuments).forEach(layout => {
@@ -4196,6 +4273,10 @@
         mirrorSecondStrip = definitions.find(
           definition => definition.key === 'strips',
         )?.mirrorSecondStrip !== false;
+        imgEditor.setSecondStripOffsetX(
+          definitions.find(definition => definition.key === 'strips').secondStripOffsetX,
+          { validate: false, notify: false },
+        );
         projectTrim = {
           left: trim.left,
           top: trim.top,
@@ -4838,6 +4919,9 @@
       'trim:modified',
       'photo-layout:modified',
       'photo-layout:view',
+      'second-strip:modified',
+      'history:undo',
+      'history:redo',
     ];
     draftEvents.forEach(eventName => {
       imgEditor.canvas.on(eventName, () => {

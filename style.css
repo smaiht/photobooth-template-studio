@@ -1764,6 +1764,18 @@ select:focus-visible,
     margin-bottom: 0;
 }
 
+.second-strip-offset-field {
+    margin-top: 10px;
+}
+
+#second-strip-offset-help {
+    margin-bottom: 0;
+}
+
+#second-strip-offset-error:not([hidden]) {
+    margin-top: 8px;
+}
+
 .photo-symmetry-settings .photo-layout-size-grid {
     margin-top: 10px;
 }
