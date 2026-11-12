@@ -23,6 +23,27 @@ python3 -m http.server 8000
 
 Open `http://localhost:8000`. Network access is required for CDN dependencies.
 
+## Deploy
+
+Point the domain's DNS at the server and allow ports 22, 80 and 443. The server
+must be reachable as root over SSH and be able to clone the Git origin. Run:
+
+```sh
+./deploy.sh root@your-server studio.so.gl
+```
+
+The server address is required and is not stored in the repository. The domain
+argument defaults to `studio.so.gl`. To register a new Let's Encrypt account with
+an email address for expiry notices, set `CERTBOT_EMAIL=you@example.com` when
+running the command. Without one, Certbot uses an existing account or registers
+without email notifications.
+
+The script commits changes in `templates/`, pushes `main`, installs missing
+Debian/Ubuntu packages, creates or fast-forwards the server checkout, configures
+Nginx and obtains an HTTPS certificate. It sets up certificate renewal and an
+Nginx reload hook. Commit other changes before running it. It refuses to replace
+an unrelated server checkout or Nginx configuration.
+
 ## Stack
 
 Vanilla JavaScript · Fabric.js · jQuery · Spectrum · Grapick
